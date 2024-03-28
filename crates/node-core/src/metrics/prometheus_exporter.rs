@@ -110,6 +110,11 @@ where
     describe_gauge!("db.table_pages", "The number of database pages for a table");
     describe_gauge!("db.table_entries", "The number of entries for a table");
     describe_gauge!("db.freelist", "The number of pages on the freelist");
+    describe_gauge!(
+        "db.timed_out_not_aborted_transactions",
+        "Number of timed out transactions that were not aborted by the user yet"
+    );
+
     describe_gauge!("static_files.segment_size", Unit::Bytes, "The size of a static file segment");
     describe_gauge!("static_files.segment_files", "The number of files for a static file segment");
     describe_gauge!(
@@ -127,8 +132,8 @@ where
 
 #[cfg(all(feature = "jemalloc", unix))]
 fn collect_memory_stats() {
-    use jemalloc_ctl::{epoch, stats};
     use metrics::gauge;
+    use tikv_jemalloc_ctl::{epoch, stats};
     use tracing::error;
 
     if epoch::advance().map_err(|error| error!(%error, "Failed to advance jemalloc epoch")).is_err()

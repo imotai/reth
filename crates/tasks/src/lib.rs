@@ -1,4 +1,8 @@
 //! Reth task management.
+//!
+//! # Feature Flags
+//!
+//! - `rayon`: Enable rayon thread pool for blocking tasks.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -37,6 +41,9 @@ use tracing_futures::Instrument;
 
 pub mod metrics;
 pub mod shutdown;
+
+#[cfg(feature = "rayon")]
+pub mod pool;
 
 /// A type that can spawn tasks.
 ///
@@ -704,7 +711,7 @@ mod tests {
     fn test_manager_graceful_shutdown() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
-        let manager = TaskManager::new(handle.clone());
+        let manager = TaskManager::new(handle);
         let executor = manager.executor();
 
         let val = Arc::new(AtomicBool::new(false));
@@ -723,9 +730,8 @@ mod tests {
     fn test_manager_graceful_shutdown_many() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
-        let manager = TaskManager::new(handle.clone());
+        let manager = TaskManager::new(handle);
         let executor = manager.executor();
-        let _e = executor.clone();
 
         let counter = Arc::new(AtomicUsize::new(0));
         let num = 10;
@@ -749,7 +755,7 @@ mod tests {
     fn test_manager_graceful_shutdown_timeout() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
-        let manager = TaskManager::new(handle.clone());
+        let manager = TaskManager::new(handle);
         let executor = manager.executor();
 
         let timeout = Duration::from_millis(500);

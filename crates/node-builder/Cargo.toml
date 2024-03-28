@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+readme = "README.md"
 
 [lints]
 workspace = true
@@ -45,6 +46,8 @@ tokio = { workspace = true, features = [
 ] }
 
 ## misc
+aquamarine.workspace = true
 eyre.workspace = true
 fdlimit = "0.3.0"
 confy.workspace = true
+rayon.workspace = true

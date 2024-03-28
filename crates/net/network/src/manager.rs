@@ -16,6 +16,7 @@
 //! to the local node. Once a (tcp) connection is established, both peers start to authenticate a [RLPx session](https://github.com/ethereum/devp2p/blob/master/rlpx.md) via a handshake. If the handshake was successful, both peers announce their capabilities and are now ready to exchange sub-protocol messages via the RLPx session.
 
 use crate::{
+    budget::{DEFAULT_BUDGET_TRY_DRAIN_NETWORK_HANDLE_CHANNEL, DEFAULT_BUDGET_TRY_DRAIN_SWARM},
     config::NetworkConfig,
     discovery::Discovery,
     error::{NetworkError, ServiceKind},
@@ -26,6 +27,7 @@ use crate::{
     metrics::{DisconnectMetrics, NetworkMetrics, NETWORK_POOL_TRANSACTIONS_SCOPE},
     network::{NetworkHandle, NetworkHandleMessage},
     peers::{PeersHandle, PeersManager},
+    poll_nested_stream_with_budget,
     protocol::IntoRlpxSubProtocol,
     session::SessionManager,
     state::NetworkState,
@@ -216,6 +218,7 @@ where
                 .await?;
         // need to retrieve the addr here since provided port could be `0`
         let local_peer_id = discovery.local_id();
+        let discv4 = discovery.discv4();
 
         let num_active_peers = Arc::new(AtomicUsize::new(0));
         let bandwidth_meter: BandwidthMeter = BandwidthMeter::default();
@@ -251,6 +254,7 @@ where
             tx_gossip_disabled,
             #[cfg(feature = "optimism")]
             sequencer_endpoint,
+            discv4,
         );
 
         Ok(Self {
@@ -355,6 +359,7 @@ where
                 head: status.blockhash,
                 network: status.chain.id(),
                 genesis: status.genesis,
+                config: Default::default(),
             },
         }
     }
@@ -545,6 +550,9 @@ where
                 .swarm
                 .sessions_mut()
                 .send_message(&peer_id, PeerMessage::PooledTransactions(msg)),
+            NetworkHandleMessage::AddTrustedPeerId(peer_id) => {
+                self.swarm.state_mut().add_trusted_peer_id(peer_id);
+            }
             NetworkHandleMessage::AddPeerAddress(peer, kind, addr) => {
                 // only add peer if we are not shutting down
                 if !self.swarm.is_shutting_down() {
@@ -641,9 +649,7 @@ where
             SwarmEvent::OutgoingTcpConnection { remote_addr, peer_id } => {
                 trace!(target: "net", ?remote_addr, ?peer_id, "Starting outbound connection.");
                 self.metrics.total_outgoing_connections.increment(1);
-                self.metrics
-                    .outgoing_connections
-                    .set(self.swarm.state().peers().num_outbound_connections() as f64);
+                self.update_pending_connection_metrics()
             }
             SwarmEvent::SessionEstablished {
                 peer_id,
@@ -657,7 +663,7 @@ where
             } => {
                 let total_active = self.num_active_peers.fetch_add(1, Ordering::Relaxed) + 1;
                 self.metrics.connected_peers.set(total_active as f64);
-                trace!(
+                debug!(
                     target: "net",
                     ?remote_addr,
                     %client_version,
@@ -674,6 +680,13 @@ where
                         .peers_mut()
                         .on_incoming_session_established(peer_id, remote_addr);
                 }
+
+                if direction.is_outgoing() {
+                    self.swarm.state_mut().peers_mut().on_active_outgoing_established(peer_id);
+                }
+
+                self.update_active_connection_metrics();
+
                 self.event_listeners.notify(NetworkEvent::SessionEstablished {
                     peer_id,
                     remote_addr,
@@ -721,15 +734,8 @@ where
                     self.swarm.state_mut().peers_mut().on_active_session_gracefully_closed(peer_id);
                 }
                 self.metrics.closed_sessions.increment(1);
-                // This can either be an incoming or outgoing connection which
-                // was closed. So we update
-                // both metrics
-                self.metrics
-                    .incoming_connections
-                    .set(self.swarm.state().peers().num_inbound_connections() as f64);
-                self.metrics
-                    .outgoing_connections
-                    .set(self.swarm.state().peers().num_outbound_connections() as f64);
+                self.update_active_connection_metrics();
+
                 if let Some(reason) = reason {
                     self.disconnect_metrics.increment(reason);
                 }
@@ -789,7 +795,7 @@ where
                 );
 
                 if let Some(ref err) = error {
-                    self.swarm.state_mut().peers_mut().on_pending_session_dropped(
+                    self.swarm.state_mut().peers_mut().on_outgoing_pending_session_dropped(
                         &remote_addr,
                         &peer_id,
                         err,
@@ -802,12 +808,11 @@ where
                     self.swarm
                         .state_mut()
                         .peers_mut()
-                        .on_pending_session_gracefully_closed(&peer_id);
+                        .on_outgoing_pending_session_gracefully_closed(&peer_id);
                 }
                 self.metrics.closed_sessions.increment(1);
-                self.metrics
-                    .outgoing_connections
-                    .set(self.swarm.state().peers().num_outbound_connections() as f64);
+                self.update_pending_connection_metrics();
+
                 self.metrics.backed_off_peers.set(
                         self.swarm
                             .state()
@@ -832,9 +837,6 @@ where
                     &error,
                 );
 
-                self.metrics
-                    .outgoing_connections
-                    .set(self.swarm.state().peers().num_outbound_connections() as f64);
                 self.metrics.backed_off_peers.set(
                         self.swarm
                             .state()
@@ -843,6 +845,7 @@ where
                             .saturating_sub(1)
                             as f64,
                     );
+                self.update_pending_connection_metrics();
             }
             SwarmEvent::BadMessage { peer_id } => {
                 self.swarm
@@ -858,6 +861,28 @@ where
                     .apply_reputation_change(&peer_id, ReputationChangeKind::BadProtocol);
             }
         }
+    }
+
+    /// Updates the metrics for active,established connections
+    #[inline]
+    fn update_active_connection_metrics(&self) {
+        self.metrics
+            .incoming_connections
+            .set(self.swarm.state().peers().num_inbound_connections() as f64);
+        self.metrics
+            .outgoing_connections
+            .set(self.swarm.state().peers().num_outbound_connections() as f64);
+    }
+
+    /// Updates the metrics for pending connections
+    #[inline]
+    fn update_pending_connection_metrics(&self) {
+        self.metrics
+            .pending_outgoing_connections
+            .set(self.swarm.state().peers().num_pending_outbound_connections() as f64);
+        self.metrics
+            .total_pending_connections
+            .set(self.swarm.sessions().num_pending_connections() as f64);
     }
 }
 
@@ -906,25 +931,7 @@ where
             this.on_block_import_result(outcome);
         }
 
-        // process incoming messages from a handle
-        let start_network_handle = Instant::now();
-        loop {
-            match this.from_handle_rx.poll_next_unpin(cx) {
-                Poll::Pending => break,
-                Poll::Ready(None) => {
-                    // This is only possible if the channel was deliberately closed since we
-                    // always have an instance of
-                    // `NetworkHandle`
-                    error!("Network message channel closed.");
-                    return Poll::Ready(())
-                }
-                Poll::Ready(Some(msg)) => this.on_handle_message(msg),
-            };
-        }
-
-        poll_durations.acc_network_handle = start_network_handle.elapsed();
-
-        // This loop drives the entire state of network and does a lot of work. Under heavy load
+        // These loops drive the entire state of network and does a lot of work. Under heavy load
         // (many messages/events), data may arrive faster than it can be processed (incoming
         // messages/requests -> events), and it is possible that more data has already arrived by
         // the time an internal event is processed. Which could turn this loop into a busy loop.
@@ -942,27 +949,39 @@ where
         // iterations in << 100µs in most cases. On average it requires ~50µs, which is inside the
         // range of what's recommended as rule of thumb.
         // <https://ryhl.io/blog/async-what-is-blocking/>
-        let mut budget = 10;
 
-        loop {
-            // advance the swarm
-            match this.swarm.poll_next_unpin(cx) {
-                Poll::Pending | Poll::Ready(None) => break,
-                Poll::Ready(Some(event)) => this.on_swarm_event(event),
-            }
+        // process incoming messages from a handle (`TransactionsManager` has one)
+        //
+        // will only be closed if the channel was deliberately closed since we always have an
+        // instance of `NetworkHandle`
+        let start_network_handle = Instant::now();
+        let maybe_more_handle_messages = poll_nested_stream_with_budget!(
+            "net",
+            "Network message channel",
+            DEFAULT_BUDGET_TRY_DRAIN_NETWORK_HANDLE_CHANNEL,
+            this.from_handle_rx.poll_next_unpin(cx),
+            |msg| this.on_handle_message(msg),
+            error!("Network channel closed");
+        );
+        poll_durations.acc_network_handle = start_network_handle.elapsed();
 
-            // ensure we still have enough budget for another iteration
-            budget -= 1;
-            if budget == 0 {
-                trace!(target: "net", budget=10, "exhausted network manager budget");
-                // make sure we're woken up again
-                cx.waker().wake_by_ref();
-                break
-            }
-        }
-
+        // process incoming messages from the network
+        let maybe_more_swarm_events = poll_nested_stream_with_budget!(
+            "net",
+            "Swarm events stream",
+            DEFAULT_BUDGET_TRY_DRAIN_SWARM,
+            this.swarm.poll_next_unpin(cx),
+            |event| this.on_swarm_event(event),
+        );
         poll_durations.acc_swarm =
             start_network_handle.elapsed() - poll_durations.acc_network_handle;
+
+        // all streams are fully drained and import futures pending
+        if maybe_more_handle_messages || maybe_more_swarm_events {
+            // make sure we're woken up again
+            cx.waker().wake_by_ref();
+            return Poll::Pending
+        }
 
         this.update_poll_metrics(start, poll_durations);
 

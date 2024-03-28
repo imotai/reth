@@ -65,7 +65,7 @@ pub(crate) type StateCacheDB = CacheDB<StateProviderDatabase<StateProviderBox>>;
 /// Commonly used transaction related functions for the [EthApi] type in the `eth_` namespace.
 ///
 /// Async functions that are spawned onto the
-/// [BlockingTaskPool](crate::blocking_pool::BlockingTaskPool) begin with `spawn_`
+/// [BlockingTaskPool](reth_tasks::pool::BlockingTaskPool) begin with `spawn_`
 ///
 ///
 /// ## Calls
@@ -276,7 +276,7 @@ pub trait EthTransactions: Send + Sync {
     /// the database that points to the beginning of the transaction.
     ///
     /// Note: Implementers should use a threadpool where blocking is allowed, such as
-    /// [BlockingTaskPool](crate::blocking_pool::BlockingTaskPool).
+    /// [BlockingTaskPool](reth_tasks::pool::BlockingTaskPool).
     async fn spawn_trace_transaction_in_block<F, R>(
         &self,
         hash: B256,
@@ -287,6 +287,32 @@ pub trait EthTransactions: Send + Sync {
         F: FnOnce(TransactionInfo, TracingInspector, ResultAndState, StateCacheDB) -> EthResult<R>
             + Send
             + 'static,
+        R: Send + 'static,
+    {
+        self.spawn_trace_transaction_in_block_with_inspector(hash, TracingInspector::new(config), f)
+            .await
+    }
+
+    /// Retrieves the transaction if it exists and returns its trace.
+    ///
+    /// Before the transaction is traced, all previous transaction in the block are applied to the
+    /// state by executing them first.
+    /// The callback `f` is invoked with the [ResultAndState] after the transaction was executed and
+    /// the database that points to the beginning of the transaction.
+    ///
+    /// Note: Implementers should use a threadpool where blocking is allowed, such as
+    /// [BlockingTaskPool](reth_tasks::pool::BlockingTaskPool).
+    async fn spawn_trace_transaction_in_block_with_inspector<Insp, F, R>(
+        &self,
+        hash: B256,
+        inspector: Insp,
+        f: F,
+    ) -> EthResult<Option<R>>
+    where
+        F: FnOnce(TransactionInfo, Insp, ResultAndState, StateCacheDB) -> EthResult<R>
+            + Send
+            + 'static,
+        Insp: for<'a> Inspector<&'a mut StateCacheDB> + Send + 'static,
         R: Send + 'static;
 
     /// Executes all transactions of a block and returns a list of callback results invoked for each
@@ -306,17 +332,60 @@ pub trait EthTransactions: Send + Sync {
         f: F,
     ) -> EthResult<Option<Vec<R>>>
     where
-        // This is the callback that's invoked for each transaction with
+        // This is the callback that's invoked for each transaction with the inspector, the result,
+        // state and db
         F: for<'a> Fn(
                 TransactionInfo,
                 TracingInspector,
                 ExecutionResult,
                 &'a State,
-                &'a CacheDB<StateProviderDatabase<StateProviderBox>>,
+                &'a StateCacheDB,
             ) -> EthResult<R>
             + Send
             + 'static,
-        R: Send + 'static;
+        R: Send + 'static,
+    {
+        self.trace_block_until(block_id, None, config, f).await
+    }
+
+    /// Executes all transactions of a block and returns a list of callback results invoked for each
+    /// transaction in the block.
+    ///
+    /// This
+    /// 1. fetches all transactions of the block
+    /// 2. configures the EVM evn
+    /// 3. loops over all transactions and executes them
+    /// 4. calls the callback with the transaction info, the execution result, the changed state
+    /// _after_ the transaction [State] and the database that points to the state
+    /// right _before_ the transaction, in other words the state the transaction was
+    /// executed on: `changed_state = tx(cached_state)`
+    ///
+    /// This accepts a `inspector_setup` closure that returns the inspector to be used for tracing
+    /// a transaction. This is invoked for each transaction.
+    async fn trace_block_with_inspector<Setup, Insp, F, R>(
+        &self,
+        block_id: BlockId,
+        insp_setup: Setup,
+        f: F,
+    ) -> EthResult<Option<Vec<R>>>
+    where
+        // This is the callback that's invoked for each transaction with the inspector, the result,
+        // state and db
+        F: for<'a> Fn(
+                TransactionInfo,
+                Insp,
+                ExecutionResult,
+                &'a State,
+                &'a StateCacheDB,
+            ) -> EthResult<R>
+            + Send
+            + 'static,
+        Setup: FnMut() -> Insp + Send + 'static,
+        Insp: for<'a> Inspector<&'a mut StateCacheDB> + Send + 'static,
+        R: Send + 'static,
+    {
+        self.trace_block_until_with_inspector(block_id, None, insp_setup, f).await
+    }
 
     /// Executes all transactions of a block.
     ///
@@ -336,10 +405,48 @@ pub trait EthTransactions: Send + Sync {
                 TracingInspector,
                 ExecutionResult,
                 &'a State,
-                &'a CacheDB<StateProviderDatabase<StateProviderBox>>,
+                &'a StateCacheDB,
             ) -> EthResult<R>
             + Send
             + 'static,
+        R: Send + 'static,
+    {
+        self.trace_block_until_with_inspector(
+            block_id,
+            highest_index,
+            move || TracingInspector::new(config),
+            f,
+        )
+        .await
+    }
+
+    /// Executes all transactions of a block.
+    ///
+    /// If a `highest_index` is given, this will only execute the first `highest_index`
+    /// transactions, in other words, it will stop executing transactions after the
+    /// `highest_index`th transaction.
+    ///
+    /// This accepts a `inspector_setup` closure that returns the inspector to be used for tracing
+    /// the transactions.
+    async fn trace_block_until_with_inspector<Setup, Insp, F, R>(
+        &self,
+        block_id: BlockId,
+        highest_index: Option<u64>,
+        inspector_setup: Setup,
+        f: F,
+    ) -> EthResult<Option<Vec<R>>>
+    where
+        F: for<'a> Fn(
+                TransactionInfo,
+                Insp,
+                ExecutionResult,
+                &'a State,
+                &'a StateCacheDB,
+            ) -> EthResult<R>
+            + Send
+            + 'static,
+        Setup: FnMut() -> Insp + Send + 'static,
+        Insp: for<'a> Inspector<&'a mut StateCacheDB> + Send + 'static,
         R: Send + 'static;
 }
 
@@ -585,7 +692,7 @@ where
             let nonce =
                 self.get_transaction_count(from, Some(BlockId::Number(BlockNumberOrTag::Pending)))?;
             // note: `.to()` can't panic because the nonce is constructed from a `u64`
-            request.nonce = Some(U64::from(nonce.to::<u64>()));
+            request.nonce = Some(nonce.to::<u64>());
         }
 
         let chain_id = self.chain_id();
@@ -624,7 +731,7 @@ where
             // gas price required
             (Some(_), None, None, None, None, None) => {
                 Some(TypedTransactionRequest::Legacy(LegacyTransactionRequest {
-                    nonce: nonce.unwrap_or_default(),
+                    nonce: U64::from(nonce.unwrap_or_default()),
                     gas_price: gas_price.unwrap_or_default(),
                     gas_limit: gas.unwrap_or_default(),
                     value: value.unwrap_or_default(),
@@ -640,7 +747,7 @@ where
             // if only accesslist is set, and no eip1599 fees
             (_, None, Some(access_list), None, None, None) => {
                 Some(TypedTransactionRequest::EIP2930(EIP2930TransactionRequest {
-                    nonce: nonce.unwrap_or_default(),
+                    nonce: U64::from(nonce.unwrap_or_default()),
                     gas_price: gas_price.unwrap_or_default(),
                     gas_limit: gas.unwrap_or_default(),
                     value: value.unwrap_or_default(),
@@ -660,7 +767,7 @@ where
             (None, _, _, None, None, None) => {
                 // Empty fields fall back to the canonical transaction schema.
                 Some(TypedTransactionRequest::EIP1559(EIP1559TransactionRequest {
-                    nonce: nonce.unwrap_or_default(),
+                    nonce: U64::from(nonce.unwrap_or_default()),
                     max_fee_per_gas: max_fee_per_gas.unwrap_or_default(),
                     max_priority_fee_per_gas: max_priority_fee_per_gas.unwrap_or_default(),
                     gas_limit: gas.unwrap_or_default(),
@@ -687,7 +794,7 @@ where
                 // As per the EIP, we follow the same semantics as EIP-1559.
                 Some(TypedTransactionRequest::EIP4844(EIP4844TransactionRequest {
                     chain_id: 0,
-                    nonce: nonce.unwrap_or_default(),
+                    nonce: U64::from(nonce.unwrap_or_default()),
                     max_priority_fee_per_gas: max_priority_fee_per_gas.unwrap_or_default(),
                     max_fee_per_gas: max_fee_per_gas.unwrap_or_default(),
                     gas_limit: gas.unwrap_or_default(),
@@ -756,8 +863,10 @@ where
         let recovered =
             signed_tx.into_ecrecovered().ok_or(EthApiError::InvalidTransactionSignature)?;
 
-        let pool_transaction =
-            <Pool::Transaction>::from_recovered_pooled_transaction(recovered.into());
+        let pool_transaction = match recovered.try_into() {
+            Ok(converted) => <Pool::Transaction>::from_recovered_pooled_transaction(converted),
+            Err(_) => return Err(EthApiError::TransactionConversionError),
+        };
 
         // submit the transaction to the pool with a `Local` origin
         let hash = self.pool().add_transaction(TransactionOrigin::Local, pool_transaction).await?;
@@ -881,16 +990,17 @@ where
         Ok(block.map(|block| (transaction, block.seal(block_hash))))
     }
 
-    async fn spawn_trace_transaction_in_block<F, R>(
+    async fn spawn_trace_transaction_in_block_with_inspector<Insp, F, R>(
         &self,
         hash: B256,
-        config: TracingInspectorConfig,
+        mut inspector: Insp,
         f: F,
     ) -> EthResult<Option<R>>
     where
-        F: FnOnce(TransactionInfo, TracingInspector, ResultAndState, StateCacheDB) -> EthResult<R>
+        F: FnOnce(TransactionInfo, Insp, ResultAndState, StateCacheDB) -> EthResult<R>
             + Send
             + 'static,
+        Insp: for<'a> Inspector<&'a mut StateCacheDB> + Send + 'static,
         R: Send + 'static,
     {
         let (transaction, block) = match self.transaction_and_block(hash).await? {
@@ -915,59 +1025,43 @@ where
             let env =
                 EnvWithHandlerCfg::new_with_cfg_env(cfg, block_env, tx_env_with_recovered(&tx));
 
-            let mut inspector = TracingInspector::new(config);
-            let (res, _, db) = inspect_and_return_db(db, env, &mut inspector)?;
+            let (res, _) = inspect(&mut db, env, &mut inspector)?;
             f(tx_info, inspector, res, db)
         })
         .await
         .map(Some)
     }
 
-    async fn trace_block_with<F, R>(
-        &self,
-        block_id: BlockId,
-        config: TracingInspectorConfig,
-        f: F,
-    ) -> EthResult<Option<Vec<R>>>
-    where
-        // This is the callback that's invoked for each transaction with
-        F: for<'a> Fn(
-                TransactionInfo,
-                TracingInspector,
-                ExecutionResult,
-                &'a State,
-                &'a CacheDB<StateProviderDatabase<StateProviderBox>>,
-            ) -> EthResult<R>
-            + Send
-            + 'static,
-        R: Send + 'static,
-    {
-        self.trace_block_until(block_id, None, config, f).await
-    }
-
-    async fn trace_block_until<F, R>(
+    async fn trace_block_until_with_inspector<Setup, Insp, F, R>(
         &self,
         block_id: BlockId,
         highest_index: Option<u64>,
-        config: TracingInspectorConfig,
+        mut inspector_setup: Setup,
         f: F,
     ) -> EthResult<Option<Vec<R>>>
     where
         F: for<'a> Fn(
                 TransactionInfo,
-                TracingInspector,
+                Insp,
                 ExecutionResult,
                 &'a State,
-                &'a CacheDB<StateProviderDatabase<StateProviderBox>>,
+                &'a StateCacheDB,
             ) -> EthResult<R>
             + Send
             + 'static,
+        Setup: FnMut() -> Insp + Send + 'static,
+        Insp: for<'a> Inspector<&'a mut StateCacheDB> + Send + 'static,
         R: Send + 'static,
     {
         let ((cfg, block_env, _), block) =
             futures::try_join!(self.evm_env_at(block_id), self.block_with_senders(block_id))?;
 
         let Some(block) = block else { return Ok(None) };
+
+        if block.body.is_empty() {
+            // nothing to trace
+            return Ok(Some(Vec::new()));
+        }
 
         // replay all transactions of the block
         self.spawn_tracing_task_with(move |this| {
@@ -1008,7 +1102,7 @@ where
             while let Some((tx_info, tx)) = transactions.next() {
                 let env = EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), tx);
 
-                let mut inspector = TracingInspector::new(config);
+                let mut inspector = inspector_setup();
                 let (res, _) = inspect(&mut db, env, &mut inspector)?;
                 let ResultAndState { result, state } = res;
                 results.push(f(tx_info, inspector, result, &state, &db)?);
@@ -1182,10 +1276,9 @@ where
     ) -> EthResult<OptimismTxMeta> {
         let Some(l1_block_info) = l1_block_info else { return Ok(OptimismTxMeta::default()) };
 
-        let mut envelope_buf = bytes::BytesMut::new();
-        tx.encode_enveloped(&mut envelope_buf);
-
         let (l1_fee, l1_data_gas) = if !tx.is_deposit() {
+            let envelope_buf = tx.envelope_encoded();
+
             let inner_l1_fee = l1_block_info
                 .l1_tx_data_fee(
                     &self.inner.provider.chain_spec(),
@@ -1252,7 +1345,7 @@ where
         from: &Address,
         request: TypedTransactionRequest,
     ) -> EthResult<TransactionSigned> {
-        for signer in self.inner.signers.iter() {
+        for signer in self.inner.signers.read().iter() {
             if signer.is_signer_for(from) {
                 return match signer.sign_transaction(request, from) {
                     Ok(tx) => Ok(tx),
@@ -1419,9 +1512,14 @@ pub(crate) fn build_transaction_receipt_with_block_receipts(
             .unwrap_or_default()
     };
 
+    let blob_gas_used = transaction.transaction.blob_gas_used().map(U128::from);
+    // Blob gas price should only be present if the transaction is a blob transaction
+    let blob_gas_price =
+        blob_gas_used.and_then(|_| meta.excess_blob_gas.map(calc_blob_gasprice).map(U128::from));
+
     #[allow(clippy::needless_update)]
     let mut res_receipt = TransactionReceipt {
-        transaction_hash: Some(meta.tx_hash),
+        transaction_hash: meta.tx_hash,
         transaction_index: U64::from(meta.index),
         block_hash: Some(meta.block_hash),
         block_number: Some(U256::from(meta.block_number)),
@@ -1438,8 +1536,8 @@ pub(crate) fn build_transaction_receipt_with_block_receipts(
         logs_bloom: receipt.bloom_slow(),
         status_code: if receipt.success { Some(U64::from(1)) } else { Some(U64::from(0)) },
         // EIP-4844 fields
-        blob_gas_price: meta.excess_blob_gas.map(calc_blob_gasprice).map(U128::from),
-        blob_gas_used: transaction.transaction.blob_gas_used().map(U128::from),
+        blob_gas_price,
+        blob_gas_used,
         ..Default::default()
     };
 
@@ -1499,17 +1597,14 @@ pub(crate) fn build_transaction_receipt_with_block_receipts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        eth::{
-            cache::EthStateCache, gas_oracle::GasPriceOracle, FeeHistoryCache,
-            FeeHistoryCacheConfig,
-        },
-        BlockingTaskPool,
+    use crate::eth::{
+        cache::EthStateCache, gas_oracle::GasPriceOracle, FeeHistoryCache, FeeHistoryCacheConfig,
     };
     use reth_network_api::noop::NoopNetwork;
     use reth_node_ethereum::EthEvmConfig;
     use reth_primitives::{constants::ETHEREUM_BLOCK_GAS_LIMIT, hex_literal::hex};
     use reth_provider::test_utils::NoopProvider;
+    use reth_tasks::pool::BlockingTaskPool;
     use reth_transaction_pool::test_utils::testing_pool;
 
     #[tokio::test]

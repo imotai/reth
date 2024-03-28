@@ -27,6 +27,9 @@ pub use handle::NodeHandle;
 pub mod provider;
 pub mod rpc;
 
+/// Support for installing the ExExs (execution extensions) in a node.
+pub mod exex;
+
 /// Re-export the core configuration traits.
 pub use reth_node_core::cli::config::{
     PayloadBuilderConfig, RethNetworkConfig, RethRpcConfig, RethTransactionPoolConfig,
@@ -34,3 +37,8 @@ pub use reth_node_core::cli::config::{
 
 // re-export the core config for convenience
 pub use reth_node_core::node_config::NodeConfig;
+
+// re-export API types for convenience
+pub use reth_node_api::*;
+
+use aquamarine as _;
