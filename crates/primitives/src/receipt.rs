@@ -1,7 +1,8 @@
 #[cfg(feature = "zstd-codec")]
 use crate::compression::{RECEIPT_COMPRESSOR, RECEIPT_DECOMPRESSOR};
-use crate::{logs_bloom, Bloom, Bytes, Log, PruneSegmentError, TxType, B256};
-use alloy_rlp::{length_of_length, Decodable, Encodable};
+use crate::{logs_bloom, Bloom, Bytes, TxType, B256};
+use alloy_primitives::Log;
+use alloy_rlp::{length_of_length, Decodable, Encodable, RlpDecodable, RlpEncodable};
 use bytes::{Buf, BufMut};
 #[cfg(any(test, feature = "arbitrary"))]
 use proptest::strategy::Strategy;
@@ -17,7 +18,8 @@ use std::{
 #[cfg_attr(feature = "zstd-codec", main_codec(no_arbitrary, zstd))]
 #[cfg_attr(not(feature = "zstd-codec"), main_codec(no_arbitrary))]
 #[add_arbitrary_tests]
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, RlpEncodable, RlpDecodable)]
+#[rlp(trailing)]
 pub struct Receipt {
     /// Receipt type.
     pub tx_type: TxType,
@@ -52,6 +54,12 @@ impl Receipt {
     /// Calculates the bloom filter for the receipt and returns the [ReceiptWithBloom] container
     /// type.
     pub fn with_bloom(self) -> ReceiptWithBloom {
+        self.into()
+    }
+
+    /// Calculates the bloom filter for the receipt and returns the [ReceiptWithBloomRef] container
+    /// type.
+    pub fn with_bloom_ref(&self) -> ReceiptWithBloomRef<'_> {
         self.into()
     }
 }
@@ -96,7 +104,7 @@ impl Receipts {
 
     /// Retrieves the receipt root for all recorded receipts from index.
     pub fn root_slow(&self, index: usize) -> Option<B256> {
-        Some(crate::proofs::calculate_receipt_root_ref(
+        Some(crate::proofs::calculate_receipt_root_no_memo(
             &self.receipt_vec[index].iter().map(Option::as_ref).collect::<Option<Vec<_>>>()?,
         ))
     }
@@ -109,25 +117,11 @@ impl Receipts {
         chain_spec: &crate::ChainSpec,
         timestamp: u64,
     ) -> Option<B256> {
-        Some(crate::proofs::calculate_receipt_root_ref_optimism(
+        Some(crate::proofs::calculate_receipt_root_no_memo_optimism(
             &self.receipt_vec[index].iter().map(Option::as_ref).collect::<Option<Vec<_>>>()?,
             chain_spec,
             timestamp,
         ))
-    }
-
-    /// Retrieves gas spent by transactions as a vector of tuples (transaction index, gas used).
-    pub fn gas_spent_by_tx(&self) -> Result<Vec<(u64, u64)>, PruneSegmentError> {
-        let Some(block_r) = self.last() else { return Ok(vec![]) };
-        let mut out = Vec::with_capacity(block_r.len());
-        for (id, tx_r) in block_r.iter().enumerate() {
-            if let Some(receipt) = tx_r.as_ref() {
-                out.push((id as u64, receipt.cumulative_gas_used));
-            } else {
-                return Err(PruneSegmentError::ReceiptsPruned)
-            }
-        }
-        Ok(out)
     }
 }
 
@@ -163,7 +157,7 @@ impl FromIterator<Vec<Option<Receipt>>> for Receipts {
 impl From<Receipt> for ReceiptWithBloom {
     fn from(receipt: Receipt) -> Self {
         let bloom = receipt.bloom_slow();
-        ReceiptWithBloom { receipt, bloom }
+        Self { receipt, bloom }
     }
 }
 
@@ -197,6 +191,17 @@ impl ReceiptWithBloom {
     fn as_encoder(&self) -> ReceiptWithBloomEncoder<'_> {
         ReceiptWithBloomEncoder { receipt: &self.receipt, bloom: &self.bloom }
     }
+}
+
+/// Retrieves gas spent by transactions as a vector of tuples (transaction index, gas used).
+pub fn gas_spent_by_transactions<T: Deref<Target = Receipt>>(
+    receipts: impl IntoIterator<Item = T>,
+) -> Vec<(u64, u64)> {
+    receipts
+        .into_iter()
+        .enumerate()
+        .map(|(id, receipt)| (id as u64, receipt.deref().cumulative_gas_used))
+        .collect()
 }
 
 #[cfg(any(test, feature = "arbitrary"))]
@@ -240,7 +245,7 @@ impl proptest::arbitrary::Arbitrary for Receipt {
         arbitrary_receipt().boxed()
     }
 
-    type Strategy = proptest::strategy::BoxedStrategy<Receipt>;
+    type Strategy = proptest::strategy::BoxedStrategy<Self>;
 }
 
 #[cfg(any(test, feature = "arbitrary"))]
@@ -578,14 +583,14 @@ mod tests {
             receipt: Receipt {
                 tx_type: TxType::Legacy,
                 cumulative_gas_used: 0x1u64,
-                logs: vec![Log {
-                    address: address!("0000000000000000000000000000000000000011"),
-                    topics: vec![
+                logs: vec![Log::new_unchecked(
+                    address!("0000000000000000000000000000000000000011"),
+                    vec![
                         b256!("000000000000000000000000000000000000000000000000000000000000dead"),
                         b256!("000000000000000000000000000000000000000000000000000000000000beef"),
                     ],
-                    data: bytes!("0100ff"),
-                }],
+                    bytes!("0100ff"),
+                )],
                 success: false,
                 #[cfg(feature = "optimism")]
                 deposit_nonce: None,
@@ -612,14 +617,14 @@ mod tests {
             receipt: Receipt {
                 tx_type: TxType::Legacy,
                 cumulative_gas_used: 0x1u64,
-                logs: vec![Log {
-                    address: address!("0000000000000000000000000000000000000011"),
-                    topics: vec![
+                logs: vec![Log::new_unchecked(
+                    address!("0000000000000000000000000000000000000011"),
+                    vec![
                         b256!("000000000000000000000000000000000000000000000000000000000000dead"),
                         b256!("000000000000000000000000000000000000000000000000000000000000beef"),
                     ],
-                    data: bytes!("0100ff"),
-                }],
+                    bytes!("0100ff"),
+                )],
                 success: false,
                 #[cfg(feature = "optimism")]
                 deposit_nonce: None,
@@ -692,20 +697,16 @@ mod tests {
             success: true,
             tx_type: TxType::Legacy,
             logs: vec![
-                Log {
-                    address: address!("4bf56695415f725e43c3e04354b604bcfb6dfb6e"),
-                    topics: vec![b256!(
-                        "c69dc3d7ebff79e41f525be431d5cd3cc08f80eaf0f7819054a726eeb7086eb9"
-                    )],
-                    data: Bytes::from(vec![1; 0xffffff]),
-                },
-                Log {
-                    address: address!("faca325c86bf9c2d5b413cd7b90b209be92229c2"),
-                    topics: vec![b256!(
-                        "8cca58667b1e9ffa004720ac99a3d61a138181963b294d270d91c53d36402ae2"
-                    )],
-                    data: Bytes::from(vec![1; 0xffffff]),
-                },
+                Log::new_unchecked(
+                    address!("4bf56695415f725e43c3e04354b604bcfb6dfb6e"),
+                    vec![b256!("c69dc3d7ebff79e41f525be431d5cd3cc08f80eaf0f7819054a726eeb7086eb9")],
+                    Bytes::from(vec![1; 0xffffff]),
+                ),
+                Log::new_unchecked(
+                    address!("faca325c86bf9c2d5b413cd7b90b209be92229c2"),
+                    vec![b256!("8cca58667b1e9ffa004720ac99a3d61a138181963b294d270d91c53d36402ae2")],
+                    Bytes::from(vec![1; 0xffffff]),
+                ),
             ],
             #[cfg(feature = "optimism")]
             deposit_nonce: None,

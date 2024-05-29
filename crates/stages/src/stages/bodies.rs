@@ -1,5 +1,11 @@
-use crate::{ExecInput, ExecOutput, Stage, StageError, UnwindInput, UnwindOutput};
+use std::{
+    cmp::Ordering,
+    task::{ready, Context, Poll},
+};
+
 use futures_util::TryStreamExt;
+use tracing::*;
+
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW},
     database::Database,
@@ -7,20 +13,19 @@ use reth_db::{
     tables,
     transaction::DbTxMut,
 };
-use reth_interfaces::{
-    p2p::bodies::{downloader::BodyDownloader, response::BlockResponse},
-    provider::ProviderResult,
-};
+use reth_network_p2p::bodies::{downloader::BodyDownloader, response::BlockResponse};
 use reth_primitives::{
     stage::{EntitiesCheckpoint, StageCheckpoint, StageId},
-    StaticFileSegment,
+    StaticFileSegment, TxNumber,
 };
-use reth_provider::{providers::StaticFileWriter, DatabaseProviderRW, HeaderProvider, StatsReader};
-use std::{
-    cmp::Ordering,
-    task::{ready, Context, Poll},
+use reth_provider::{
+    providers::{StaticFileProvider, StaticFileWriter},
+    BlockReader, DatabaseProviderRW, HeaderProvider, ProviderError, StatsReader,
 };
-use tracing::*;
+use reth_stages_api::{ExecInput, ExecOutput, StageError, UnwindInput, UnwindOutput};
+
+use reth_stages_api::Stage;
+use reth_storage_errors::provider::ProviderResult;
 
 // TODO(onbjerg): Metrics and events (gradual status for e.g. CLI)
 /// The body stage downloads block bodies.
@@ -120,6 +125,7 @@ impl<DB: Database, D: BodyDownloader> Stage<DB> for BodyStage<D> {
         let mut tx_block_cursor = tx.cursor_write::<tables::TransactionBlocks>()?;
         let mut ommers_cursor = tx.cursor_write::<tables::BlockOmmers>()?;
         let mut withdrawals_cursor = tx.cursor_write::<tables::BlockWithdrawals>()?;
+        let mut requests_cursor = tx.cursor_write::<tables::BlockRequests>()?;
 
         // Get id for the next tx_num of zero if there are no transactions.
         let mut next_tx_num = tx_block_cursor.last()?.map(|(id, _)| id + 1).unwrap_or_default();
@@ -139,23 +145,22 @@ impl<DB: Database, D: BodyDownloader> Stage<DB> for BodyStage<D> {
             // If static files are ahead, then we didn't reach the database commit in a previous
             // stage run. So, our only solution is to unwind the static files and proceed from the
             // database expected height.
-            Ordering::Greater => static_file_producer
-                .prune_transactions(next_static_file_tx_num - next_tx_num, from_block - 1)?,
+            Ordering::Greater => {
+                static_file_producer
+                    .prune_transactions(next_static_file_tx_num - next_tx_num, from_block - 1)?;
+                // Since this is a database <-> static file inconsistency, we commit the change
+                // straight away.
+                static_file_producer.commit()?;
+            }
             // If static files are behind, then there was some corruption or loss of files. This
             // error will trigger an unwind, that will bring the database to the same height as the
             // static files.
             Ordering::Less => {
-                let last_block = static_file_provider
-                    .get_highest_static_file_block(StaticFileSegment::Transactions)
-                    .unwrap_or_default();
-
-                let missing_block =
-                    Box::new(provider.sealed_header(last_block + 1)?.unwrap_or_default());
-
-                return Err(StageError::MissingStaticFileData {
-                    block: missing_block,
-                    segment: StaticFileSegment::Transactions,
-                })
+                return Err(missing_static_data_error(
+                    next_static_file_tx_num.saturating_sub(1),
+                    static_file_provider,
+                    provider,
+                )?)
             }
             Ordering::Equal => {}
         }
@@ -232,6 +237,13 @@ impl<DB: Database, D: BodyDownloader> Stage<DB> for BodyStage<D> {
                                 .append(block_number, StoredBlockWithdrawals { withdrawals })?;
                         }
                     }
+
+                    // Write requests if any
+                    if let Some(requests) = block.requests {
+                        if !requests.0.is_empty() {
+                            requests_cursor.append(block_number, requests)?;
+                        }
+                    }
                 }
                 BlockResponse::Empty(_) => {}
             };
@@ -267,6 +279,7 @@ impl<DB: Database, D: BodyDownloader> Stage<DB> for BodyStage<D> {
         let mut body_cursor = tx.cursor_write::<tables::BlockBodyIndices>()?;
         let mut ommers_cursor = tx.cursor_write::<tables::BlockOmmers>()?;
         let mut withdrawals_cursor = tx.cursor_write::<tables::BlockWithdrawals>()?;
+        let mut requests_cursor = tx.cursor_write::<tables::BlockRequests>()?;
         // Cursors to unwind transitions
         let mut tx_block_cursor = tx.cursor_write::<tables::TransactionBlocks>()?;
 
@@ -284,6 +297,11 @@ impl<DB: Database, D: BodyDownloader> Stage<DB> for BodyStage<D> {
             // Delete the withdrawals entry if any
             if withdrawals_cursor.seek_exact(number)?.is_some() {
                 withdrawals_cursor.delete_current()?;
+            }
+
+            // Delete the requests entry if any
+            if requests_cursor.seek_exact(number)?.is_some() {
+                requests_cursor.delete_current()?;
             }
 
             // Delete all transaction to block values.
@@ -311,17 +329,11 @@ impl<DB: Database, D: BodyDownloader> Stage<DB> for BodyStage<D> {
         // If there are more transactions on database, then we are missing static file data and we
         // need to unwind further.
         if db_tx_num > static_file_tx_num {
-            let last_block = static_file_provider
-                .get_highest_static_file_block(StaticFileSegment::Transactions)
-                .unwrap_or_default();
-
-            let missing_block =
-                Box::new(provider.sealed_header(last_block + 1)?.unwrap_or_default());
-
-            return Err(StageError::MissingStaticFileData {
-                block: missing_block,
-                segment: StaticFileSegment::Transactions,
-            })
+            return Err(missing_static_data_error(
+                static_file_tx_num,
+                static_file_provider,
+                provider,
+            )?)
         }
 
         // Unwinds static file
@@ -333,6 +345,37 @@ impl<DB: Database, D: BodyDownloader> Stage<DB> for BodyStage<D> {
                 .with_entities_stage_checkpoint(stage_checkpoint(provider)?),
         })
     }
+}
+
+fn missing_static_data_error<DB: Database>(
+    last_tx_num: TxNumber,
+    static_file_provider: &StaticFileProvider,
+    provider: &DatabaseProviderRW<DB>,
+) -> Result<StageError, ProviderError> {
+    let mut last_block = static_file_provider
+        .get_highest_static_file_block(StaticFileSegment::Transactions)
+        .unwrap_or_default();
+
+    // To be extra safe, we make sure that the last tx num matches the last block from its indices.
+    // If not, get it.
+    loop {
+        if let Some(indices) = provider.block_body_indices(last_block)? {
+            if indices.last_tx_num() <= last_tx_num {
+                break
+            }
+        }
+        if last_block == 0 {
+            break
+        }
+        last_block -= 1;
+    }
+
+    let missing_block = Box::new(provider.sealed_header(last_block + 1)?.unwrap_or_default());
+
+    Ok(StageError::MissingStaticFileData {
+        block: missing_block,
+        segment: StaticFileSegment::Transactions,
+    })
 }
 
 // TODO(alexey): ideally, we want to measure Bodies stage progress in bytes, but it's hard to know
@@ -352,13 +395,17 @@ fn stage_checkpoint<DB: Database>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use assert_matches::assert_matches;
+
+    use reth_primitives::stage::StageUnitCheckpoint;
+    use reth_provider::StaticFileProviderFactory;
+    use test_utils::*;
+
     use crate::test_utils::{
         stage_test_suite_ext, ExecuteStageTestRunner, StageTestRunner, UnwindStageTestRunner,
     };
-    use assert_matches::assert_matches;
-    use reth_primitives::stage::StageUnitCheckpoint;
-    use test_utils::*;
+
+    use super::*;
 
     stage_test_suite_ext!(BodyTestRunner, body);
 
@@ -546,6 +593,7 @@ mod tests {
             let mut static_file_producer =
                 static_file_provider.latest_writer(StaticFileSegment::Transactions).unwrap();
             static_file_producer.prune_transactions(1, checkpoint.block_number).unwrap();
+            static_file_producer.commit().unwrap();
         }
         // Unwind all of it
         let unwind_to = 1;
@@ -566,15 +614,16 @@ mod tests {
     }
 
     mod test_utils {
-        use crate::{
-            stages::bodies::BodyStage,
-            test_utils::{
-                ExecuteStageTestRunner, StageTestRunner, TestRunnerError, TestStageDB,
-                UnwindStageTestRunner,
-            },
-            ExecInput, ExecOutput, UnwindInput,
+        use std::{
+            collections::{HashMap, VecDeque},
+            ops::RangeInclusive,
+            pin::Pin,
+            sync::Arc,
+            task::{Context, Poll},
         };
+
         use futures_util::Stream;
+
         use reth_db::{
             cursor::DbCursorRO,
             models::{StoredBlockBodyIndices, StoredBlockOmmers},
@@ -584,32 +633,33 @@ mod tests {
             transaction::{DbTx, DbTxMut},
             DatabaseEnv,
         };
-        use reth_interfaces::{
-            p2p::{
-                bodies::{
-                    downloader::{BodyDownloader, BodyDownloaderResult},
-                    response::BlockResponse,
-                },
-                error::DownloadResult,
+        use reth_network_p2p::{
+            bodies::{
+                downloader::{BodyDownloader, BodyDownloaderResult},
+                response::BlockResponse,
             },
-            test_utils::{
-                generators,
-                generators::{random_block_range, random_signed_tx},
-            },
+            error::DownloadResult,
         };
         use reth_primitives::{
             BlockBody, BlockHash, BlockNumber, Header, SealedBlock, SealedHeader,
             StaticFileSegment, TxNumber, B256,
         };
         use reth_provider::{
-            providers::StaticFileWriter, HeaderProvider, ProviderFactory, TransactionsProvider,
+            providers::StaticFileWriter, HeaderProvider, ProviderFactory,
+            StaticFileProviderFactory, TransactionsProvider,
         };
-        use std::{
-            collections::{HashMap, VecDeque},
-            ops::RangeInclusive,
-            pin::Pin,
-            sync::Arc,
-            task::{Context, Poll},
+        use reth_stages_api::{ExecInput, ExecOutput, UnwindInput};
+        use reth_testing_utils::{
+            generators,
+            generators::{random_block_range, random_signed_tx},
+        };
+
+        use crate::{
+            stages::bodies::BodyStage,
+            test_utils::{
+                ExecuteStageTestRunner, StageTestRunner, TestRunnerError, TestStageDB,
+                UnwindStageTestRunner,
+            },
         };
 
         /// The block hash of the genesis block.
@@ -623,6 +673,7 @@ mod tests {
                     transactions: block.body.clone(),
                     ommers: block.ommers.clone(),
                     withdrawals: block.withdrawals.clone(),
+                    requests: block.requests.clone(),
                 },
             )
         }
@@ -901,6 +952,7 @@ mod tests {
                             body: body.transactions,
                             ommers: body.ommers,
                             withdrawals: body.withdrawals,
+                            requests: body.requests,
                         }));
                     }
 

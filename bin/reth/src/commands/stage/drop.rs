@@ -11,11 +11,12 @@ use crate::{
 use clap::Parser;
 use itertools::Itertools;
 use reth_db::{open_db, static_file::iter_static_files, tables, transaction::DbTxMut, DatabaseEnv};
-use reth_node_core::init::{insert_genesis_header, insert_genesis_history, insert_genesis_state};
+use reth_db_common::init::{insert_genesis_header, insert_genesis_history, insert_genesis_state};
+use reth_fs_util as fs;
 use reth_primitives::{
-    fs, stage::StageId, static_file::find_fixed_range, ChainSpec, StaticFileSegment,
+    stage::StageId, static_file::find_fixed_range, ChainSpec, StaticFileSegment,
 };
-use reth_provider::{providers::StaticFileWriter, ProviderFactory};
+use reth_provider::{providers::StaticFileWriter, ProviderFactory, StaticFileProviderFactory};
 use std::sync::Arc;
 
 /// `reth drop-stage` command
@@ -54,12 +55,12 @@ impl Command {
     pub async fn execute(self) -> eyre::Result<()> {
         // add network name to data dir
         let data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain);
-        let db_path = data_dir.db_path();
+        let db_path = data_dir.db();
         fs::create_dir_all(&db_path)?;
 
         let db = open_db(db_path.as_ref(), self.db.database_args())?;
         let provider_factory =
-            ProviderFactory::new(db, self.chain.clone(), data_dir.static_files_path())?;
+            ProviderFactory::new(db, self.chain.clone(), data_dir.static_files())?;
         let static_file_provider = provider_factory.static_file_provider();
 
         let tool = DbTool::new(provider_factory, self.chain.clone())?;
@@ -109,6 +110,7 @@ impl Command {
                 tx.clear::<tables::TransactionBlocks>()?;
                 tx.clear::<tables::BlockOmmers>()?;
                 tx.clear::<tables::BlockWithdrawals>()?;
+                tx.clear::<tables::BlockRequests>()?;
                 tx.put::<tables::StageCheckpoints>(
                     StageId::Bodies.to_string(),
                     Default::default(),
@@ -133,7 +135,8 @@ impl Command {
                     StageId::Execution.to_string(),
                     Default::default(),
                 )?;
-                insert_genesis_state::<DatabaseEnv>(tx, self.chain.genesis())?;
+                let alloc = &self.chain.genesis().alloc;
+                insert_genesis_state::<DatabaseEnv>(tx, alloc.len(), alloc.iter())?;
             }
             StageEnum::AccountHashing => {
                 tx.clear::<tables::HashedAccounts>()?;
@@ -191,7 +194,7 @@ impl Command {
                     StageId::IndexStorageHistory.to_string(),
                     Default::default(),
                 )?;
-                insert_genesis_history(&provider_rw, &self.chain.genesis)?;
+                insert_genesis_history(&provider_rw, self.chain.genesis.alloc.iter())?;
             }
             StageEnum::TxLookup => {
                 tx.clear::<tables::TransactionHashNumbers>()?;

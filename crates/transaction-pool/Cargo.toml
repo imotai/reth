@@ -13,13 +13,14 @@ workspace = true
 
 [dependencies]
 # reth
-reth-eth-wire.workspace = true
+reth-eth-wire-types.workspace = true
 reth-primitives.workspace = true
+reth-fs-util.workspace = true
 reth-provider.workspace = true
 reth-tasks.workspace = true
-revm.workspace = true
+
+# ethereum
 alloy-rlp.workspace = true
-reth-revm = { workspace = true, optional = true }
 
 # async/futures
 futures-util.workspace = true
@@ -35,11 +36,11 @@ metrics.workspace = true
 aquamarine.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+rustc-hash.workspace = true
 schnellru.workspace = true
 serde = { workspace = true, features = ["derive", "rc"], optional = true }
-fnv = "1.0.7"
 bitflags.workspace = true
-auto_impl = "1.0"
+auto_impl.workspace = true
 smallvec.workspace = true
 itertools.workspace = true
 

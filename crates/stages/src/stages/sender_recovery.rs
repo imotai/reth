@@ -1,4 +1,5 @@
-use crate::{BlockErrorKind, ExecInput, ExecOutput, Stage, StageError, UnwindInput, UnwindOutput};
+use reth_config::config::SenderRecoveryConfig;
+use reth_consensus::ConsensusError;
 use reth_db::{
     cursor::DbCursorRW,
     database::Database,
@@ -7,15 +8,16 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
     RawValue,
 };
-use reth_interfaces::consensus;
 use reth_primitives::{
-    keccak256,
     stage::{EntitiesCheckpoint, StageCheckpoint, StageId},
     Address, PruneSegment, StaticFileSegment, TransactionSignedNoHash, TxNumber,
 };
 use reth_provider::{
     BlockReader, DatabaseProviderRW, HeaderProvider, ProviderError, PruneCheckpointReader,
     StatsReader,
+};
+use reth_stages_api::{
+    BlockErrorKind, ExecInput, ExecOutput, Stage, StageError, UnwindInput, UnwindOutput,
 };
 use std::{fmt::Debug, ops::Range, sync::mpsc};
 use thiserror::Error;
@@ -41,8 +43,8 @@ pub struct SenderRecoveryStage {
 
 impl SenderRecoveryStage {
     /// Create new instance of [SenderRecoveryStage].
-    pub fn new(commit_threshold: u64) -> Self {
-        Self { commit_threshold }
+    pub fn new(config: SenderRecoveryConfig) -> Self {
+        Self { commit_threshold: config.commit_threshold }
     }
 }
 
@@ -208,7 +210,7 @@ fn recover_range<DB: Database>(
                             Err(StageError::Block {
                                 block: Box::new(sealed_header),
                                 error: BlockErrorKind::Validation(
-                                    consensus::ConsensusError::TransactionSignerRecoveryError,
+                                    ConsensusError::TransactionSignerRecoveryError,
                                 ),
                             })
                         }
@@ -229,16 +231,13 @@ fn recover_sender(
     (tx_id, tx): (TxNumber, TransactionSignedNoHash),
     rlp_buf: &mut Vec<u8>,
 ) -> Result<(u64, Address), Box<SenderRecoveryStageError>> {
-    tx.transaction.encode_without_signature(rlp_buf);
-
     // We call [Signature::recover_signer_unchecked] because transactions run in the pipeline are
     // known to be valid - this means that we do not need to check whether or not the `s` value is
     // greater than `secp256k1n / 2` if past EIP-2. There are transactions pre-homestead which have
     // large `s` values, so using [Signature::recover_signer] here would not be
     // backwards-compatible.
     let sender = tx
-        .signature
-        .recover_signer_unchecked(keccak256(rlp_buf))
+        .encode_and_recover_unchecked(rlp_buf)
         .ok_or(SenderRecoveryStageError::FailedRecovery(FailedSenderRecoveryError { tx: tx_id }))?;
 
     Ok((tx_id, sender))
@@ -286,15 +285,18 @@ struct FailedSenderRecoveryError {
 mod tests {
     use assert_matches::assert_matches;
     use reth_db::cursor::DbCursorRO;
-    use reth_interfaces::test_utils::{
-        generators,
-        generators::{random_block, random_block_range},
-    };
     use reth_primitives::{
         stage::StageUnitCheckpoint, BlockNumber, PruneCheckpoint, PruneMode, SealedBlock,
         TransactionSigned, B256,
     };
-    use reth_provider::{providers::StaticFileWriter, PruneCheckpointWriter, TransactionsProvider};
+    use reth_provider::{
+        providers::StaticFileWriter, PruneCheckpointWriter, StaticFileProviderFactory,
+        TransactionsProvider,
+    };
+    use reth_testing_utils::{
+        generators,
+        generators::{random_block, random_block_range},
+    };
 
     use super::*;
     use crate::test_utils::{
@@ -505,10 +507,9 @@ mod tests {
         /// # Panics
         ///
         /// 1. If there are any entries in the [tables::TransactionSenders] table above a given
-        /// block number.
-        ///
+        ///    block number.
         /// 2. If the is no requested block entry in the bodies table, but
-        /// [tables::TransactionSenders] is not empty.
+        ///    [tables::TransactionSenders] is not empty.
         fn ensure_no_senders_by_block(&self, block: BlockNumber) -> Result<(), TestRunnerError> {
             let body_result = self
                 .db

@@ -1,6 +1,5 @@
-use crate::{ExecInput, ExecOutput, Stage, StageError, UnwindInput, UnwindOutput};
 use num_traits::Zero;
-use reth_config::config::EtlConfig;
+use reth_config::config::{EtlConfig, TransactionLookupConfig};
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW},
     database::Database,
@@ -9,7 +8,6 @@ use reth_db::{
     RawKey, RawValue,
 };
 use reth_etl::Collector;
-use reth_interfaces::provider::ProviderError;
 use reth_primitives::{
     stage::{EntitiesCheckpoint, StageCheckpoint, StageId},
     PruneCheckpoint, PruneMode, PrunePurpose, PruneSegment, TxHash, TxNumber,
@@ -18,6 +16,8 @@ use reth_provider::{
     BlockReader, DatabaseProviderRW, PruneCheckpointReader, PruneCheckpointWriter, StatsReader,
     TransactionsProvider, TransactionsProviderExt,
 };
+use reth_stages_api::{ExecInput, ExecOutput, Stage, StageError, UnwindInput, UnwindOutput};
+use reth_storage_errors::provider::ProviderError;
 use tracing::*;
 
 /// The transaction lookup stage.
@@ -45,8 +45,12 @@ impl Default for TransactionLookupStage {
 
 impl TransactionLookupStage {
     /// Create new instance of [TransactionLookupStage].
-    pub fn new(chunk_size: u64, etl_config: EtlConfig, prune_mode: Option<PruneMode>) -> Self {
-        Self { chunk_size, etl_config, prune_mode }
+    pub fn new(
+        config: TransactionLookupConfig,
+        etl_config: EtlConfig,
+        prune_mode: Option<PruneMode>,
+    ) -> Self {
+        Self { chunk_size: config.chunk_size, etl_config, prune_mode }
     }
 }
 
@@ -104,7 +108,7 @@ impl<DB: Database> Stage<DB> for TransactionLookupStage {
         let mut hash_collector: Collector<TxHash, TxNumber> =
             Collector::new(self.etl_config.file_size, self.etl_config.dir.clone());
 
-        debug!(
+        info!(
             target: "sync::stages::transaction_lookup",
             tx_range = ?input.checkpoint().block_number..=input.target(),
             "Updating transaction lookup"
@@ -116,7 +120,7 @@ impl<DB: Database> Stage<DB> for TransactionLookupStage {
 
             let end_block = *block_range.end();
 
-            debug!(target: "sync::stages::transaction_lookup", ?tx_range, "Calculating transaction hashes");
+            info!(target: "sync::stages::transaction_lookup", ?tx_range, "Calculating transaction hashes");
 
             for (key, value) in provider.transaction_hashes_by_range(tx_range)? {
                 hash_collector.insert(key, value)?;
@@ -139,26 +143,27 @@ impl<DB: Database> Stage<DB> for TransactionLookupStage {
                 for (index, hash_to_number) in hash_collector.iter()?.enumerate() {
                     let (hash, number) = hash_to_number?;
                     if index > 0 && index % interval == 0 {
-                        debug!(
+                        info!(
                             target: "sync::stages::transaction_lookup",
                             ?append_only,
-                            progress = format!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
+                            progress = %format!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
                             "Inserting hashes"
                         );
                     }
 
+                    let key = RawKey::<TxHash>::from_vec(hash);
                     if append_only {
-                        txhash_cursor.append(
-                            RawKey::<TxHash>::from_vec(hash),
-                            RawValue::<TxNumber>::from_vec(number),
-                        )?;
+                        txhash_cursor.append(key, RawValue::<TxNumber>::from_vec(number))?
                     } else {
-                        txhash_cursor.insert(
-                            RawKey::<TxHash>::from_vec(hash),
-                            RawValue::<TxNumber>::from_vec(number),
-                        )?;
+                        txhash_cursor.insert(key, RawValue::<TxNumber>::from_vec(number))?
                     }
                 }
+
+                trace!(target: "sync::stages::transaction_lookup",
+                    total_hashes,
+                    "Transaction hashes inserted"
+                );
+
                 break
             }
         }
@@ -237,12 +242,12 @@ mod tests {
         TestRunnerError, TestStageDB, UnwindStageTestRunner,
     };
     use assert_matches::assert_matches;
-    use reth_interfaces::test_utils::{
+    use reth_primitives::{stage::StageUnitCheckpoint, BlockNumber, SealedBlock, B256};
+    use reth_provider::{providers::StaticFileWriter, StaticFileProviderFactory};
+    use reth_testing_utils::{
         generators,
         generators::{random_block, random_block_range},
     };
-    use reth_primitives::{stage::StageUnitCheckpoint, BlockNumber, SealedBlock, B256};
-    use reth_provider::providers::StaticFileWriter;
     use std::ops::Sub;
 
     // Implement stage test suite.
@@ -423,10 +428,9 @@ mod tests {
         /// # Panics
         ///
         /// 1. If there are any entries in the [tables::TransactionHashNumbers] table above a given
-        /// block    number.
-        ///
+        ///    block number.
         /// 2. If the is no requested block entry in the bodies table, but
-        /// [tables::TransactionHashNumbers] is    not empty.
+        ///    [tables::TransactionHashNumbers] is    not empty.
         fn ensure_no_hash_by_block(&self, number: BlockNumber) -> Result<(), TestRunnerError> {
             let body_result = self
                 .db
