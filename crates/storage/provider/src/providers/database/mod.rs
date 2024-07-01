@@ -3,31 +3,31 @@ use crate::{
     to_range,
     traits::{BlockSource, ReceiptProvider},
     BlockHashReader, BlockNumReader, BlockReader, ChainSpecProvider, DatabaseProviderFactory,
-    EvmEnvProvider, HeaderProvider, HeaderSyncGap, HeaderSyncGapProvider, HeaderSyncMode,
-    ProviderError, PruneCheckpointReader, RequestsProvider, StageCheckpointReader,
-    StateProviderBox, StaticFileProviderFactory, TransactionVariant, TransactionsProvider,
-    WithdrawalsProvider,
+    EvmEnvProvider, HeaderProvider, HeaderSyncGap, HeaderSyncGapProvider, ProviderError,
+    PruneCheckpointReader, RequestsProvider, StageCheckpointReader, StateProviderBox,
+    StaticFileProviderFactory, TransactionVariant, TransactionsProvider, WithdrawalsProvider,
 };
-use reth_db::{
-    database::Database, init_db, mdbx::DatabaseArguments, models::StoredBlockBodyIndices,
-    DatabaseEnv,
-};
+use reth_chainspec::{ChainInfo, ChainSpec};
+use reth_db::{init_db, mdbx::DatabaseArguments, DatabaseEnv};
+use reth_db_api::{database::Database, models::StoredBlockBodyIndices};
 use reth_errors::{RethError, RethResult};
 use reth_evm::ConfigureEvmEnv;
 use reth_primitives::{
-    stage::{StageCheckpoint, StageId},
-    Address, Block, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders, ChainInfo,
-    ChainSpec, Header, PruneCheckpoint, PruneSegment, Receipt, SealedBlock, SealedBlockWithSenders,
-    SealedHeader, StaticFileSegment, TransactionMeta, TransactionSigned, TransactionSignedNoHash,
-    TxHash, TxNumber, Withdrawal, Withdrawals, B256, U256,
+    Address, Block, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders, Header, Receipt,
+    SealedBlock, SealedBlockWithSenders, SealedHeader, StaticFileSegment, TransactionMeta,
+    TransactionSigned, TransactionSignedNoHash, TxHash, TxNumber, Withdrawal, Withdrawals, B256,
+    U256,
 };
+use reth_prune_types::{PruneCheckpoint, PruneSegment};
+use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_errors::provider::ProviderResult;
 use revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
 use std::{
     ops::{RangeBounds, RangeInclusive},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
+use tokio::sync::watch;
 use tracing::trace;
 
 mod metrics;
@@ -53,13 +53,9 @@ impl<DB> ProviderFactory<DB> {
     pub fn new(
         db: DB,
         chain_spec: Arc<ChainSpec>,
-        static_files_path: PathBuf,
-    ) -> ProviderResult<Self> {
-        Ok(Self {
-            db: Arc::new(db),
-            chain_spec,
-            static_file_provider: StaticFileProvider::new(static_files_path)?,
-        })
+        static_file_provider: StaticFileProvider,
+    ) -> Self {
+        Self { db: Arc::new(db), chain_spec, static_file_provider }
     }
 
     /// Enables metrics on the static file provider.
@@ -87,12 +83,12 @@ impl ProviderFactory<DatabaseEnv> {
         path: P,
         chain_spec: Arc<ChainSpec>,
         args: DatabaseArguments,
-        static_files_path: PathBuf,
+        static_file_provider: StaticFileProvider,
     ) -> RethResult<Self> {
         Ok(Self {
             db: Arc::new(init_db(path, args).map_err(RethError::msg)?),
             chain_spec,
-            static_file_provider: StaticFileProvider::new(static_files_path)?,
+            static_file_provider,
         })
     }
 }
@@ -170,10 +166,10 @@ impl<DB> StaticFileProviderFactory for ProviderFactory<DB> {
 impl<DB: Database> HeaderSyncGapProvider for ProviderFactory<DB> {
     fn sync_gap(
         &self,
-        mode: HeaderSyncMode,
+        tip: watch::Receiver<B256>,
         highest_uninterrupted_block: BlockNumber,
     ) -> ProviderResult<HeaderSyncGap> {
-        self.provider()?.sync_gap(mode, highest_uninterrupted_block)
+        self.provider()?.sync_gap(tip, highest_uninterrupted_block)
     }
 }
 
@@ -334,6 +330,14 @@ impl<DB: Database> BlockReader for ProviderFactory<DB> {
         self.provider()?.block_with_senders(id, transaction_kind)
     }
 
+    fn sealed_block_with_senders(
+        &self,
+        id: BlockHashOrNumber,
+        transaction_kind: TransactionVariant,
+    ) -> ProviderResult<Option<SealedBlockWithSenders>> {
+        self.provider()?.sealed_block_with_senders(id, transaction_kind)
+    }
+
     fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Block>> {
         self.provider()?.block_range(range)
     }
@@ -343,6 +347,13 @@ impl<DB: Database> BlockReader for ProviderFactory<DB> {
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<BlockWithSenders>> {
         self.provider()?.block_with_senders_range(range)
+    }
+
+    fn sealed_block_with_senders_range(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+    ) -> ProviderResult<Vec<SealedBlockWithSenders>> {
+        self.provider()?.sealed_block_with_senders_range(range)
     }
 }
 
@@ -516,22 +527,6 @@ impl<DB: Database> EvmEnvProvider for ProviderFactory<DB> {
         self.provider()?.fill_env_with_header(cfg, block_env, header, evm_config)
     }
 
-    fn fill_block_env_at(
-        &self,
-        block_env: &mut BlockEnv,
-        at: BlockHashOrNumber,
-    ) -> ProviderResult<()> {
-        self.provider()?.fill_block_env_at(block_env, at)
-    }
-
-    fn fill_block_env_with_header(
-        &self,
-        block_env: &mut BlockEnv,
-        header: &Header,
-    ) -> ProviderResult<()> {
-        self.provider()?.fill_block_env_with_header(block_env, header)
-    }
-
     fn fill_cfg_env_at<EvmConfig>(
         &self,
         cfg: &mut CfgEnvWithHandlerCfg,
@@ -588,21 +583,21 @@ impl<DB> Clone for ProviderFactory<DB> {
 mod tests {
     use super::*;
     use crate::{
-        providers::StaticFileWriter, test_utils::create_test_provider_factory, BlockHashReader,
-        BlockNumReader, BlockWriter, HeaderSyncGapProvider, HeaderSyncMode, TransactionsProvider,
+        providers::{StaticFileProvider, StaticFileWriter},
+        test_utils::create_test_provider_factory,
+        BlockHashReader, BlockNumReader, BlockWriter, HeaderSyncGapProvider, TransactionsProvider,
     };
     use alloy_rlp::Decodable;
     use assert_matches::assert_matches;
     use rand::Rng;
+    use reth_chainspec::ChainSpecBuilder;
     use reth_db::{
         mdbx::DatabaseArguments,
         tables,
         test_utils::{create_test_static_files_dir, ERROR_TEMPDIR},
     };
-    use reth_primitives::{
-        hex_literal::hex, ChainSpecBuilder, PruneMode, PruneModes, SealedBlock, StaticFileSegment,
-        TxNumber, B256, U256,
-    };
+    use reth_primitives::{hex_literal::hex, SealedBlock, StaticFileSegment, TxNumber, B256, U256};
+    use reth_prune_types::{PruneMode, PruneModes};
     use reth_storage_errors::provider::ProviderError;
     use reth_testing_utils::{
         generators,
@@ -645,7 +640,7 @@ mod tests {
             tempfile::TempDir::new().expect(ERROR_TEMPDIR).into_path(),
             Arc::new(chain_spec),
             DatabaseArguments::new(Default::default()),
-            static_dir_path,
+            StaticFileProvider::read_write(static_dir_path).unwrap(),
         )
         .unwrap();
 
@@ -744,7 +739,6 @@ mod tests {
         let mut rng = generators::rng();
         let consensus_tip = rng.gen();
         let (_tip_tx, tip_rx) = watch::channel(consensus_tip);
-        let mode = HeaderSyncMode::Tip(tip_rx);
 
         // Genesis
         let checkpoint = 0;
@@ -752,7 +746,7 @@ mod tests {
 
         // Empty database
         assert_matches!(
-            provider.sync_gap(mode.clone(), checkpoint),
+            provider.sync_gap(tip_rx.clone(), checkpoint),
             Err(ProviderError::HeaderNotFound(block_number))
                 if block_number.as_number().unwrap() == checkpoint
         );
@@ -764,7 +758,7 @@ mod tests {
         static_file_writer.commit().unwrap();
         drop(static_file_writer);
 
-        let gap = provider.sync_gap(mode, checkpoint).unwrap();
+        let gap = provider.sync_gap(tip_rx, checkpoint).unwrap();
         assert_eq!(gap.local_head, head);
         assert_eq!(gap.target.tip(), consensus_tip.into());
     }

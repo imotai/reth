@@ -4,15 +4,15 @@ use crate::{logs_bloom, Bloom, Bytes, TxType, B256};
 use alloy_primitives::Log;
 use alloy_rlp::{length_of_length, Decodable, Encodable, RlpDecodable, RlpEncodable};
 use bytes::{Buf, BufMut};
-#[cfg(any(test, feature = "arbitrary"))]
-use proptest::strategy::Strategy;
+use core::{cmp::Ordering, ops::Deref};
+use derive_more::{Deref, DerefMut, From, IntoIterator};
 #[cfg(feature = "zstd-codec")]
 use reth_codecs::CompactZstd;
 use reth_codecs::{add_arbitrary_tests, main_codec, Compact};
-use std::{
-    cmp::Ordering,
-    ops::{Deref, DerefMut},
-};
+use serde::{Deserialize, Serialize};
+
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
 
 /// Receipt containing result of transaction execution.
 #[cfg_attr(feature = "zstd-codec", main_codec(no_arbitrary, zstd))]
@@ -45,48 +45,45 @@ pub struct Receipt {
 }
 
 impl Receipt {
-    /// Calculates [`Log`]'s bloom filter. this is slow operation and [ReceiptWithBloom] can
+    /// Calculates [`Log`]'s bloom filter. this is slow operation and [`ReceiptWithBloom`] can
     /// be used to cache this value.
     pub fn bloom_slow(&self) -> Bloom {
         logs_bloom(self.logs.iter())
     }
 
-    /// Calculates the bloom filter for the receipt and returns the [ReceiptWithBloom] container
+    /// Calculates the bloom filter for the receipt and returns the [`ReceiptWithBloom`] container
     /// type.
     pub fn with_bloom(self) -> ReceiptWithBloom {
         self.into()
     }
 
-    /// Calculates the bloom filter for the receipt and returns the [ReceiptWithBloomRef] container
-    /// type.
+    /// Calculates the bloom filter for the receipt and returns the [`ReceiptWithBloomRef`]
+    /// container type.
     pub fn with_bloom_ref(&self) -> ReceiptWithBloomRef<'_> {
         self.into()
     }
 }
 
 /// A collection of receipts organized as a two-dimensional vector.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    From,
+    Deref,
+    DerefMut,
+    IntoIterator,
+)]
 pub struct Receipts {
     /// A two-dimensional vector of optional `Receipt` instances.
     pub receipt_vec: Vec<Vec<Option<Receipt>>>,
 }
 
 impl Receipts {
-    /// Create a new `Receipts` instance with an empty vector.
-    pub fn new() -> Self {
-        Self { receipt_vec: vec![] }
-    }
-
-    /// Create a new `Receipts` instance from an existing vector.
-    pub fn from_vec(vec: Vec<Vec<Option<Receipt>>>) -> Self {
-        Self { receipt_vec: vec }
-    }
-
-    /// Create a new `Receipts` instance from a single block receipt.
-    pub fn from_block_receipt(block_receipts: Vec<Receipt>) -> Self {
-        Self { receipt_vec: vec![block_receipts.into_iter().map(Option::Some).collect()] }
-    }
-
     /// Returns the length of the `Receipts` vector.
     pub fn len(&self) -> usize {
         self.receipt_vec.len()
@@ -114,7 +111,7 @@ impl Receipts {
     pub fn optimism_root_slow(
         &self,
         index: usize,
-        chain_spec: &crate::ChainSpec,
+        chain_spec: &reth_chainspec::ChainSpec,
         timestamp: u64,
     ) -> Option<B256> {
         Some(crate::proofs::calculate_receipt_root_no_memo_optimism(
@@ -125,32 +122,15 @@ impl Receipts {
     }
 }
 
-impl Deref for Receipts {
-    type Target = Vec<Vec<Option<Receipt>>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.receipt_vec
-    }
-}
-
-impl DerefMut for Receipts {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.receipt_vec
-    }
-}
-
-impl IntoIterator for Receipts {
-    type Item = Vec<Option<Receipt>>;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.receipt_vec.into_iter()
+impl From<Vec<Receipt>> for Receipts {
+    fn from(block_receipts: Vec<Receipt>) -> Self {
+        Self { receipt_vec: vec![block_receipts.into_iter().map(Option::Some).collect()] }
     }
 }
 
 impl FromIterator<Vec<Option<Receipt>>> for Receipts {
     fn from_iter<I: IntoIterator<Item = Vec<Option<Receipt>>>>(iter: I) -> Self {
-        Self::from_vec(iter.into_iter().collect())
+        iter.into_iter().collect::<Vec<_>>().into()
     }
 }
 
@@ -172,8 +152,8 @@ pub struct ReceiptWithBloom {
 }
 
 impl ReceiptWithBloom {
-    /// Create new [ReceiptWithBloom]
-    pub fn new(receipt: Receipt, bloom: Bloom) -> Self {
+    /// Create new [`ReceiptWithBloom`]
+    pub const fn new(receipt: Receipt, bloom: Bloom) -> Self {
         Self { receipt, bloom }
     }
 
@@ -188,7 +168,7 @@ impl ReceiptWithBloom {
     }
 
     #[inline]
-    fn as_encoder(&self) -> ReceiptWithBloomEncoder<'_> {
+    const fn as_encoder(&self) -> ReceiptWithBloomEncoder<'_> {
         ReceiptWithBloomEncoder { receipt: &self.receipt, bloom: &self.bloom }
     }
 }
@@ -202,50 +182,6 @@ pub fn gas_spent_by_transactions<T: Deref<Target = Receipt>>(
         .enumerate()
         .map(|(id, receipt)| (id as u64, receipt.deref().cumulative_gas_used))
         .collect()
-}
-
-#[cfg(any(test, feature = "arbitrary"))]
-impl proptest::arbitrary::Arbitrary for Receipt {
-    type Parameters = ();
-
-    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::{any, prop_compose};
-
-        prop_compose! {
-            fn arbitrary_receipt()(tx_type in any::<TxType>(),
-                        success in any::<bool>(),
-                        cumulative_gas_used in any::<u64>(),
-                        logs in proptest::collection::vec(proptest::arbitrary::any::<Log>(), 0..=20),
-                        _deposit_nonce in any::<Option<u64>>(),
-                        _deposit_receipt_version in any::<Option<u64>>()) -> Receipt
-            {
-                // Only receipts for deposit transactions may contain a deposit nonce
-                #[cfg(feature = "optimism")]
-                let (deposit_nonce, deposit_receipt_version) = if tx_type == TxType::Deposit {
-                    // The deposit receipt version is only present if the deposit nonce is present
-                    let deposit_receipt_version = _deposit_nonce.and(_deposit_receipt_version);
-                    (_deposit_nonce, deposit_receipt_version)
-                } else {
-                    (None, None)
-                };
-
-                Receipt { tx_type,
-                    success,
-                    cumulative_gas_used,
-                    logs,
-                    // Only receipts for deposit transactions may contain a deposit nonce
-                    #[cfg(feature = "optimism")]
-                    deposit_nonce,
-                    // Only receipts for deposit transactions may contain a deposit nonce
-                    #[cfg(feature = "optimism")]
-                    deposit_receipt_version
-                }
-            }
-        }
-        arbitrary_receipt().boxed()
-    }
-
-    type Strategy = proptest::strategy::BoxedStrategy<Self>;
 }
 
 #[cfg(any(test, feature = "arbitrary"))]
@@ -283,7 +219,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Receipt {
 impl ReceiptWithBloom {
     /// Returns the enveloped encoded receipt.
     ///
-    /// See also [ReceiptWithBloom::encode_enveloped]
+    /// See also [`ReceiptWithBloom::encode_enveloped`]
     pub fn envelope_encoded(&self) -> Bytes {
         let mut buf = Vec::new();
         self.encode_enveloped(&mut buf);
@@ -429,8 +365,8 @@ pub struct ReceiptWithBloomRef<'a> {
 }
 
 impl<'a> ReceiptWithBloomRef<'a> {
-    /// Create new [ReceiptWithBloomRef]
-    pub fn new(receipt: &'a Receipt, bloom: Bloom) -> Self {
+    /// Create new [`ReceiptWithBloomRef`]
+    pub const fn new(receipt: &'a Receipt, bloom: Bloom) -> Self {
         Self { receipt, bloom }
     }
 
@@ -440,7 +376,7 @@ impl<'a> ReceiptWithBloomRef<'a> {
     }
 
     #[inline]
-    fn as_encoder(&self) -> ReceiptWithBloomEncoder<'_> {
+    const fn as_encoder(&self) -> ReceiptWithBloomEncoder<'_> {
         ReceiptWithBloomEncoder { receipt: self.receipt, bloom: &self.bloom }
     }
 }

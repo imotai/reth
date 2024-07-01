@@ -1,7 +1,8 @@
 //! Configuration files.
 
-use reth_network::{PeersConfig, SessionsConfig};
-use reth_primitives::PruneModes;
+use reth_network_types::{PeersConfig, SessionsConfig};
+use reth_prune_types::PruneModes;
+use reth_stages_types::ExecutionStageThresholds;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     ffi::OsStr,
@@ -28,7 +29,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Returns the [PeersConfig] for the node.
+    /// Returns the [`PeersConfig`] for the node.
     ///
     /// If a peers file is provided, the basic nodes from the file are added to the configuration.
     pub fn peers_config_with_basic_nodes_from_file(
@@ -53,7 +54,7 @@ impl Config {
     }
 
     /// Sets the pruning configuration.
-    pub fn update_prune_confing(&mut self, prune_config: PruneConfig) {
+    pub fn update_prune_config(&mut self, prune_config: PruneConfig) {
         self.prune = Some(prune_config);
     }
 }
@@ -142,7 +143,7 @@ pub struct BodiesConfig {
     pub downloader_request_limit: u64,
     /// The maximum number of block bodies returned at once from the stream
     ///
-    /// Default: 1_000
+    /// Default: `1_000`
     pub downloader_stream_batch_size: usize,
     /// The size of the internal block buffer in bytes.
     ///
@@ -216,6 +217,17 @@ impl Default for ExecutionConfig {
     }
 }
 
+impl From<ExecutionConfig> for ExecutionStageThresholds {
+    fn from(config: ExecutionConfig) -> Self {
+        Self {
+            max_blocks: config.max_blocks,
+            max_changes: config.max_changes,
+            max_cumulative_gas: config.max_cumulative_gas,
+            max_duration: config.max_duration,
+        }
+    }
+}
+
 /// Hashing stage configuration.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default)]
@@ -280,7 +292,7 @@ impl Default for EtlConfig {
 
 impl EtlConfig {
     /// Creates an ETL configuration
-    pub fn new(dir: Option<PathBuf>, file_size: usize) -> Self {
+    pub const fn new(dir: Option<PathBuf>, file_size: usize) -> Self {
         Self { dir, file_size }
     }
 
@@ -324,6 +336,13 @@ pub struct PruneConfig {
 impl Default for PruneConfig {
     fn default() -> Self {
         Self { block_interval: 5, segments: PruneModes::none() }
+    }
+}
+
+impl PruneConfig {
+    /// Returns whether there is any kind of receipt pruning configuration.
+    pub fn has_receipts_pruning(&self) -> bool {
+        self.segments.receipts.is_some() || !self.segments.receipts_log_filter.is_empty()
     }
 }
 

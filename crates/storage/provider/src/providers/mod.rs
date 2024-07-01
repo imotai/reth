@@ -2,7 +2,7 @@ use crate::{
     AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt,
     BlockSource, BlockchainTreePendingStateProvider, CanonChainTracker, CanonStateNotifications,
     CanonStateSubscriptions, ChainSpecProvider, ChangeSetReader, DatabaseProviderFactory,
-    EvmEnvProvider, FullBundleStateDataProvider, HeaderProvider, ProviderError,
+    EvmEnvProvider, FullExecutionDataProvider, HeaderProvider, ProviderError,
     PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt, RequestsProvider,
     StageCheckpointReader, StateProviderBox, StateProviderFactory, StaticFileProviderFactory,
     TransactionVariant, TransactionsProvider, TreeViewer, WithdrawalsProvider,
@@ -12,19 +12,20 @@ use reth_blockchain_tree_api::{
     BlockValidationKind, BlockchainTreeEngine, BlockchainTreeViewer, CanonicalOutcome,
     InsertPayloadOk,
 };
-use reth_db::{
+use reth_chainspec::{ChainInfo, ChainSpec};
+use reth_db_api::{
     database::Database,
     models::{AccountBeforeTx, StoredBlockBodyIndices},
 };
 use reth_evm::ConfigureEvmEnv;
 use reth_primitives::{
-    stage::{StageCheckpoint, StageId},
     Account, Address, Block, BlockHash, BlockHashOrNumber, BlockId, BlockNumHash, BlockNumber,
-    BlockNumberOrTag, BlockWithSenders, ChainInfo, ChainSpec, Header, PruneCheckpoint,
-    PruneSegment, Receipt, SealedBlock, SealedBlockWithSenders, SealedHeader, TransactionMeta,
-    TransactionSigned, TransactionSignedNoHash, TxHash, TxNumber, Withdrawal, Withdrawals, B256,
-    U256,
+    BlockNumberOrTag, BlockWithSenders, Header, Receipt, SealedBlock, SealedBlockWithSenders,
+    SealedHeader, TransactionMeta, TransactionSigned, TransactionSignedNoHash, TxHash, TxNumber,
+    Withdrawal, Withdrawals, B256, U256,
 };
+use reth_prune_types::{PruneCheckpoint, PruneSegment};
+use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_errors::provider::ProviderResult;
 use revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
 use std::{
@@ -40,8 +41,8 @@ pub use database::*;
 
 mod static_file;
 pub use static_file::{
-    StaticFileJarProvider, StaticFileProvider, StaticFileProviderRW, StaticFileProviderRWRefMut,
-    StaticFileWriter,
+    StaticFileAccess, StaticFileJarProvider, StaticFileProvider, StaticFileProviderRW,
+    StaticFileProviderRWRefMut, StaticFileWriter,
 };
 
 mod state;
@@ -129,12 +130,12 @@ where
 {
     /// Ensures that the given block number is canonical (synced)
     ///
-    /// This is a helper for guarding the [HistoricalStateProvider] against block numbers that are
+    /// This is a helper for guarding the [`HistoricalStateProvider`] against block numbers that are
     /// out of range and would lead to invalid results, mainly during initial sync.
     ///
-    /// Verifying the block_number would be expensive since we need to lookup sync table
+    /// Verifying the `block_number` would be expensive since we need to lookup sync table
     /// Instead, we ensure that the `block_number` is within the range of the
-    /// [Self::best_block_number] which is updated when a block is synced.
+    /// [`Self::best_block_number`] which is updated when a block is synced.
     #[inline]
     fn ensure_canonical_block(&self, block_number: BlockNumber) -> ProviderResult<()> {
         let latest = self.best_block_number()?;
@@ -315,7 +316,7 @@ where
 
     /// Returns the block with senders with matching number or hash from database.
     ///
-    /// **NOTE: If [TransactionVariant::NoHash] is provided then the transactions have invalid
+    /// **NOTE: If [`TransactionVariant::NoHash`] is provided then the transactions have invalid
     /// hashes, since they would need to be calculated on the spot, and we want fast querying.**
     ///
     /// Returns `None` if block is not found.
@@ -327,6 +328,14 @@ where
         self.database.block_with_senders(id, transaction_kind)
     }
 
+    fn sealed_block_with_senders(
+        &self,
+        id: BlockHashOrNumber,
+        transaction_kind: TransactionVariant,
+    ) -> ProviderResult<Option<SealedBlockWithSenders>> {
+        self.database.sealed_block_with_senders(id, transaction_kind)
+    }
+
     fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Block>> {
         self.database.block_range(range)
     }
@@ -336,6 +345,13 @@ where
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<BlockWithSenders>> {
         self.database.block_with_senders_range(range)
+    }
+
+    fn sealed_block_with_senders_range(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+    ) -> ProviderResult<Vec<SealedBlockWithSenders>> {
+        self.database.sealed_block_with_senders_range(range)
     }
 }
 
@@ -530,22 +546,6 @@ where
         self.database.provider()?.fill_env_with_header(cfg, block_env, header, evm_config)
     }
 
-    fn fill_block_env_at(
-        &self,
-        block_env: &mut BlockEnv,
-        at: BlockHashOrNumber,
-    ) -> ProviderResult<()> {
-        self.database.provider()?.fill_block_env_at(block_env, at)
-    }
-
-    fn fill_block_env_with_header(
-        &self,
-        block_env: &mut BlockEnv,
-        header: &Header,
-    ) -> ProviderResult<()> {
-        self.database.provider()?.fill_block_env_with_header(block_env, header)
-    }
-
     fn fill_cfg_env_at<EvmConfig>(
         &self,
         cfg: &mut CfgEnvWithHandlerCfg,
@@ -634,7 +634,7 @@ where
     /// Returns the state provider for pending state.
     ///
     /// If there's no pending block available then the latest state provider is returned:
-    /// [Self::latest]
+    /// [`Self::latest`]
     fn pending(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", "Getting provider for pending state");
 
@@ -657,7 +657,7 @@ where
 
     fn pending_with_provider(
         &self,
-        bundle_state_data: Box<dyn FullBundleStateDataProvider>,
+        bundle_state_data: Box<dyn FullExecutionDataProvider>,
     ) -> ProviderResult<StateProviderBox> {
         let canonical_fork = bundle_state_data.canonical_fork();
         trace!(target: "providers::blockchain", ?canonical_fork, "Returning post state provider");
@@ -684,7 +684,7 @@ where
         self.tree.insert_block(block, validation_kind)
     }
 
-    fn finalize_block(&self, finalized_block: BlockNumber) {
+    fn finalize_block(&self, finalized_block: BlockNumber) -> ProviderResult<()> {
         self.tree.finalize_block(finalized_block)
     }
 
@@ -876,7 +876,7 @@ where
     fn find_pending_state_provider(
         &self,
         block_hash: BlockHash,
-    ) -> Option<Box<dyn FullBundleStateDataProvider>> {
+    ) -> Option<Box<dyn FullExecutionDataProvider>> {
         self.tree.find_pending_state_provider(block_hash)
     }
 }

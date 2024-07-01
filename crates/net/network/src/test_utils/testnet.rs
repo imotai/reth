@@ -12,10 +12,10 @@ use crate::{
 };
 use futures::{FutureExt, StreamExt};
 use pin_project::pin_project;
+use reth_chainspec::MAINNET;
 use reth_eth_wire::{protocol::Protocol, DisconnectReason, HelloMessageWithProtocols};
 use reth_network_api::{NetworkInfo, Peers};
-use reth_network_types::PeerId;
-use reth_primitives::MAINNET;
+use reth_network_peers::PeerId;
 use reth_provider::{
     test_utils::NoopProvider, BlockReader, BlockReaderIdExt, HeaderProvider, StateProviderFactory,
 };
@@ -260,7 +260,7 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        for peer in this.peers.iter_mut() {
+        for peer in &mut this.peers {
             let _ = peer.poll_unpin(cx);
         }
         Poll::Pending
@@ -364,11 +364,11 @@ where
     }
 
     /// The address that listens for incoming connections.
-    pub fn local_addr(&self) -> SocketAddr {
+    pub const fn local_addr(&self) -> SocketAddr {
         self.network.local_addr()
     }
 
-    /// The [PeerId] of this peer.
+    /// The [`PeerId`] of this peer.
     pub fn peer_id(&self) -> PeerId {
         *self.network.peer_id()
     }
@@ -384,7 +384,7 @@ where
     }
 
     /// Returns the [`TestPool`] of this peer.
-    pub fn pool(&self) -> Option<&Pool> {
+    pub const fn pool(&self) -> Option<&Pool> {
         self.pool.as_ref()
     }
 
@@ -440,7 +440,7 @@ impl<C> Peer<C>
 where
     C: BlockReader + HeaderProvider + Clone,
 {
-    /// Installs a new [TestPool]
+    /// Installs a new [`TestPool`]
     pub fn install_test_pool(&mut self) {
         self.install_transactions_manager(TestPoolBuilder::default().into())
     }
@@ -508,17 +508,17 @@ impl<Pool> PeerHandle<Pool> {
     }
 
     /// Returns the [`TransactionsHandle`] of this peer.
-    pub fn transactions(&self) -> Option<&TransactionsHandle> {
+    pub const fn transactions(&self) -> Option<&TransactionsHandle> {
         self.transactions.as_ref()
     }
 
     /// Returns the [`TestPool`] of this peer.
-    pub fn pool(&self) -> Option<&Pool> {
+    pub const fn pool(&self) -> Option<&Pool> {
         self.pool.as_ref()
     }
 
     /// Returns the [`NetworkHandle`] of this peer.
-    pub fn network(&self) -> &NetworkHandle {
+    pub const fn network(&self) -> &NetworkHandle {
         &self.network
     }
 }
@@ -598,7 +598,7 @@ pub struct NetworkEventStream {
 
 impl NetworkEventStream {
     /// Create a new [`NetworkEventStream`] from the given network event receiver stream.
-    pub fn new(inner: EventStream<NetworkEvent>) -> Self {
+    pub const fn new(inner: EventStream<NetworkEvent>) -> Self {
         Self { inner }
     }
 

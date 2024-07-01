@@ -3,17 +3,18 @@
 //! Optimism builder support
 
 use alloy_rlp::Encodable;
-use reth_engine_primitives::{BuiltPayload, PayloadBuilderAttributes};
+use reth_chainspec::{ChainSpec, EthereumHardforks};
+use reth_evm_optimism::revm_spec_by_timestamp_after_bedrock;
 use reth_payload_builder::EthPayloadBuilderAttributes;
+use reth_payload_primitives::{BuiltPayload, PayloadBuilderAttributes};
 use reth_primitives::{
-    revm::config::revm_spec_by_timestamp_after_merge,
     revm_primitives::{BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, SpecId},
-    Address, BlobTransactionSidecar, ChainSpec, Header, SealedBlock, TransactionSigned,
-    Withdrawals, B256, U256,
+    Address, BlobTransactionSidecar, Header, SealedBlock, TransactionSigned, Withdrawals, B256,
+    U256,
 };
 use reth_rpc_types::engine::{
     ExecutionPayloadEnvelopeV2, ExecutionPayloadV1, OptimismExecutionPayloadEnvelopeV3,
-    OptimismExecutionPayloadEnvelopeV4, OptimismPayloadAttributes, PayloadId,
+    OptimismExecutionPayloadEnvelopeV4, PayloadId,
 };
 use reth_rpc_types_compat::engine::payload::{
     block_to_payload_v1, block_to_payload_v3, block_to_payload_v4,
@@ -22,12 +23,15 @@ use reth_rpc_types_compat::engine::payload::{
 use revm::primitives::HandlerCfg;
 use std::sync::Arc;
 
+/// Re-export for use in downstream arguments.
+pub use reth_rpc_types::engine::OptimismPayloadAttributes;
+
 /// Optimism Payload Builder Attributes
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptimismPayloadBuilderAttributes {
     /// Inner ethereum payload builder attributes
     pub payload_attributes: EthPayloadBuilderAttributes,
-    /// NoTxPool option for the generated payload
+    /// `NoTxPool` option for the generated payload
     pub no_tx_pool: bool,
     /// Transactions for the generated payload
     pub transactions: Vec<TransactionSigned>,
@@ -41,7 +45,7 @@ impl PayloadBuilderAttributes for OptimismPayloadBuilderAttributes {
 
     /// Creates a new payload builder for the given parent block and the attributes.
     ///
-    /// Derives the unique [PayloadId] for the given parent and attributes
+    /// Derives the unique [`PayloadId`] for the given parent and attributes
     fn try_new(parent: B256, attributes: OptimismPayloadAttributes) -> Result<Self, Self::Error> {
         let (id, transactions) = {
             let transactions: Vec<_> = attributes
@@ -109,7 +113,7 @@ impl PayloadBuilderAttributes for OptimismPayloadBuilderAttributes {
         let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
 
         // ensure we're not missing any timestamp based hardforks
-        let spec_id = revm_spec_by_timestamp_after_merge(chain_spec, self.timestamp());
+        let spec_id = revm_spec_by_timestamp_after_bedrock(chain_spec, self.timestamp());
 
         // if the parent block did not have excess blob gas (i.e. it was pre-cancun), but it is
         // cancun now, we need to set the excess blob gas to the default value
@@ -176,7 +180,7 @@ pub struct OptimismBuiltPayload {
 
 impl OptimismBuiltPayload {
     /// Initializes the payload with the given initial block.
-    pub fn new(
+    pub const fn new(
         id: PayloadId,
         block: SealedBlock,
         fees: U256,
@@ -187,17 +191,17 @@ impl OptimismBuiltPayload {
     }
 
     /// Returns the identifier of the payload.
-    pub fn id(&self) -> PayloadId {
+    pub const fn id(&self) -> PayloadId {
         self.id
     }
 
     /// Returns the built block(sealed)
-    pub fn block(&self) -> &SealedBlock {
+    pub const fn block(&self) -> &SealedBlock {
         &self.block
     }
 
     /// Fees of the block
-    pub fn fees(&self) -> U256 {
+    pub const fn fees(&self) -> U256 {
         self.fees
     }
 
@@ -298,7 +302,7 @@ impl From<OptimismBuiltPayload> for OptimismExecutionPayloadEnvelopeV4 {
     }
 }
 
-/// Generates the payload id for the configured payload from the [OptimismPayloadAttributes].
+/// Generates the payload id for the configured payload from the [`OptimismPayloadAttributes`].
 ///
 /// Returns an 8-byte identifier by hashing the payload components with sha256 hash.
 pub(crate) fn payload_id_optimism(

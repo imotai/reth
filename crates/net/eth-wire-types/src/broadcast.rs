@@ -19,6 +19,8 @@ use std::{
 
 #[cfg(feature = "arbitrary")]
 use proptest::{collection::vec, prelude::*};
+#[cfg(feature = "arbitrary")]
+use proptest_arbitrary_interop::arb;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -137,7 +139,7 @@ pub enum NewPooledTransactionHashes {
 
 impl NewPooledTransactionHashes {
     /// Returns the message [`EthVersion`].
-    pub fn version(&self) -> EthVersion {
+    pub const fn version(&self) -> EthVersion {
         match self {
             Self::Eth66(_) => EthVersion::Eth66,
             Self::Eth68(_) => EthVersion::Eth68,
@@ -145,7 +147,7 @@ impl NewPooledTransactionHashes {
     }
 
     /// Returns `true` if the payload is valid for the given version
-    pub fn is_valid_for_version(&self, version: EthVersion) -> bool {
+    pub const fn is_valid_for_version(&self, version: EthVersion) -> bool {
         match self {
             Self::Eth66(_) => {
                 matches!(version, EthVersion::Eth67 | EthVersion::Eth66)
@@ -165,7 +167,7 @@ impl NewPooledTransactionHashes {
     }
 
     /// Returns an immutable reference to transaction hashes.
-    pub fn hashes(&self) -> &Vec<B256> {
+    pub const fn hashes(&self) -> &Vec<B256> {
         match self {
             Self::Eth66(msg) => &msg.0,
             Self::Eth68(msg) => &msg.hashes,
@@ -226,7 +228,7 @@ impl NewPooledTransactionHashes {
     }
 
     /// Returns an immutable reference to the inner type if this an eth68 announcement.
-    pub fn as_eth68(&self) -> Option<&NewPooledTransactionHashes68> {
+    pub const fn as_eth68(&self) -> Option<&NewPooledTransactionHashes68> {
         match self {
             Self::Eth66(_) => None,
             Self::Eth68(msg) => Some(msg),
@@ -351,7 +353,7 @@ impl Arbitrary for NewPooledTransactionHashes68 {
             .prop_flat_map(|len| {
                 // Use the generated length to create vectors of TxType, usize, and B256
                 let types_vec =
-                    vec(any::<reth_primitives::TxType>().prop_map(|ty| ty as u8), len..=len);
+                    vec(arb::<reth_primitives::TxType>().prop_map(|ty| ty as u8), len..=len);
 
                 // Map the usize values to the range 0..131072(0x20000)
                 let sizes_vec = vec(proptest::num::usize::ANY.prop_map(|x| x % 131072), len..=len);
@@ -597,17 +599,17 @@ handle_mempool_data_map_impl!(PartiallyValidData<V>, <V>);
 
 impl<V> PartiallyValidData<V> {
     /// Wraps raw data.
-    pub fn from_raw_data(data: HashMap<TxHash, V>, version: Option<EthVersion>) -> Self {
+    pub const fn from_raw_data(data: HashMap<TxHash, V>, version: Option<EthVersion>) -> Self {
         Self { data, version }
     }
 
     /// Wraps raw data with version [`EthVersion::Eth68`].
-    pub fn from_raw_data_eth68(data: HashMap<TxHash, V>) -> Self {
+    pub const fn from_raw_data_eth68(data: HashMap<TxHash, V>) -> Self {
         Self::from_raw_data(data, Some(EthVersion::Eth68))
     }
 
     /// Wraps raw data with version [`EthVersion::Eth66`].
-    pub fn from_raw_data_eth66(data: HashMap<TxHash, V>) -> Self {
+    pub const fn from_raw_data_eth66(data: HashMap<TxHash, V>) -> Self {
         Self::from_raw_data(data, Some(EthVersion::Eth66))
     }
 
@@ -625,7 +627,7 @@ impl<V> PartiallyValidData<V> {
 
     /// Returns the version of the message this data was received in if different versions of the
     /// message exists, either [`Eth66`](EthVersion::Eth66) or [`Eth68`](EthVersion::Eth68).
-    pub fn msg_version(&self) -> Option<EthVersion> {
+    pub const fn msg_version(&self) -> Option<EthVersion> {
         self.version
     }
 
