@@ -6,7 +6,10 @@ use alloy_eips::{
 };
 use alloy_primitives::{keccak256, Address, Bytes, B256, B64, U256};
 use alloy_rlp::Encodable;
-use alloy_rpc_types_engine::{ExecutionPayloadEnvelopeV2, ExecutionPayloadV1, PayloadId};
+use alloy_rpc_types_engine::{
+    ExecutionPayloadEnvelopeV2, ExecutionPayloadFieldV2, ExecutionPayloadV1, ExecutionPayloadV3,
+    PayloadId,
+};
 use op_alloy_consensus::{encode_holocene_extra_data, EIP1559ParamError};
 /// Re-export for use in downstream arguments.
 pub use op_alloy_rpc_types_engine::OpPayloadAttributes;
@@ -18,9 +21,7 @@ use reth_optimism_primitives::{OpBlock, OpPrimitives, OpTransactionSigned};
 use reth_payload_builder::EthPayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayload, PayloadBuilderAttributes};
 use reth_primitives::{transaction::WithEncoded, SealedBlock};
-use reth_rpc_types_compat::engine::payload::{
-    block_to_payload_v1, block_to_payload_v3, convert_block_to_payload_field_v2,
-};
+
 use std::sync::Arc;
 
 /// Optimism Payload Builder Attributes
@@ -228,7 +229,10 @@ impl BuiltPayload for &OpBuiltPayload {
 // V1 engine_getPayloadV1 response
 impl From<OpBuiltPayload> for ExecutionPayloadV1 {
     fn from(value: OpBuiltPayload) -> Self {
-        block_to_payload_v1(Arc::unwrap_or_clone(value.block))
+        Self::from_block_unchecked(
+            value.block().hash(),
+            &Arc::unwrap_or_clone(value.block).into_block(),
+        )
     }
 }
 
@@ -239,7 +243,10 @@ impl From<OpBuiltPayload> for ExecutionPayloadEnvelopeV2 {
 
         Self {
             block_value: fees,
-            execution_payload: convert_block_to_payload_field_v2(Arc::unwrap_or_clone(block)),
+            execution_payload: ExecutionPayloadFieldV2::from_block_unchecked(
+                block.hash(),
+                &Arc::unwrap_or_clone(block).into_block(),
+            ),
         }
     }
 }
@@ -255,7 +262,10 @@ impl From<OpBuiltPayload> for OpExecutionPayloadEnvelopeV3 {
                 B256::ZERO
             };
         Self {
-            execution_payload: block_to_payload_v3(Arc::unwrap_or_clone(block)),
+            execution_payload: ExecutionPayloadV3::from_block_unchecked(
+                block.hash(),
+                &Arc::unwrap_or_clone(block).into_block(),
+            ),
             block_value: fees,
             // From the engine API spec:
             //
@@ -282,7 +292,10 @@ impl From<OpBuiltPayload> for OpExecutionPayloadEnvelopeV4 {
                 B256::ZERO
             };
         Self {
-            execution_payload: block_to_payload_v3(Arc::unwrap_or_clone(block)),
+            execution_payload: ExecutionPayloadV3::from_block_unchecked(
+                block.hash(),
+                &Arc::unwrap_or_clone(block).into_block(),
+            ),
             block_value: fees,
             // From the engine API spec:
             //
