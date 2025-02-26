@@ -13,12 +13,12 @@ use crate::{
 };
 use alloy_primitives::B256;
 use alloy_provider::Provider;
+use alloy_rpc_types_engine::ExecutionPayload;
 use clap::Parser;
 use csv::Writer;
 use reth_cli_runner::CliContext;
 use reth_node_core::args::BenchmarkArgs;
-use reth_rpc_types_compat::engine::payload::block_to_payload;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
 /// `reth benchmark new-payload-only` command
@@ -56,19 +56,27 @@ impl Command {
         // put results in a summary vec so they can be printed at the end
         let mut results = Vec::new();
         let total_benchmark_duration = Instant::now();
+        let mut total_wait_time = Duration::ZERO;
 
-        while let Some(block) = receiver.recv().await {
+        while let Some(block) = {
+            let wait_start = Instant::now();
+            let result = receiver.recv().await;
+            total_wait_time += wait_start.elapsed();
+            result
+        } {
             // just put gas used here
             let gas_used = block.gas_used;
 
             let versioned_hashes: Vec<B256> =
                 block.body().blob_versioned_hashes_iter().copied().collect();
             let parent_beacon_block_root = block.parent_beacon_block_root;
-            let payload = block_to_payload(block).0;
+            let (payload, _) =
+                ExecutionPayload::from_block_unchecked(block.hash(), &block.into_block());
 
             let block_number = payload.block_number();
 
             debug!(
+                target: "reth-bench",
                 number=?payload.block_number(),
                 "Sending payload to engine",
             );
@@ -80,8 +88,9 @@ impl Command {
             let new_payload_result = NewPayloadResult { gas_used, latency: start.elapsed() };
             info!(%new_payload_result);
 
-            // current duration since the start of the benchmark
-            let current_duration = total_benchmark_duration.elapsed();
+            // current duration since the start of the benchmark minus the time
+            // waiting for blocks
+            let current_duration = total_benchmark_duration.elapsed() - total_wait_time;
 
             // record the current result
             let row = TotalGasRow { block_number, gas_used, time: current_duration };

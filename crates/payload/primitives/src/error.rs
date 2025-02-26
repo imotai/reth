@@ -1,10 +1,10 @@
 //! Error types emitted by types or implementations of this crate.
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, string::ToString};
 use alloy_primitives::B256;
-use alloy_rpc_types_engine::ForkchoiceUpdateError;
+use alloy_rpc_types_engine::{ForkchoiceUpdateError, PayloadError, PayloadStatusEnum};
+use core::error;
 use reth_errors::{ProviderError, RethError};
-use revm_primitives::EVMError;
 use tokio::sync::oneshot;
 
 /// Possible error variants during payload building.
@@ -27,13 +27,21 @@ pub enum PayloadBuilderError {
     Internal(#[from] RethError),
     /// Unrecoverable error during evm execution.
     #[error("evm execution error: {0}")]
-    EvmExecutionError(EVMError<ProviderError>),
+    EvmExecutionError(Box<dyn core::error::Error + Send + Sync>),
     /// Any other payload building errors.
     #[error(transparent)]
     Other(Box<dyn core::error::Error + Send + Sync>),
 }
 
 impl PayloadBuilderError {
+    /// Create a new EVM error from a boxed error.
+    pub fn evm<E>(error: E) -> Self
+    where
+        E: core::error::Error + Send + Sync + 'static,
+    {
+        Self::EvmExecutionError(Box::new(error))
+    }
+
     /// Create a new error from a boxed error.
     pub fn other<E>(error: E) -> Self
     where
@@ -106,6 +114,45 @@ pub enum VersionSpecificValidationError {
     /// root after Cancun
     #[error("no parent beacon block root post-cancun")]
     NoParentBeaconBlockRootPostCancun,
+}
+
+/// Error validating payload received over `newPayload` API.
+#[derive(thiserror::Error, Debug)]
+pub enum NewPayloadError {
+    /// Payload validation error.
+    #[error(transparent)]
+    Eth(#[from] PayloadError),
+    /// Custom payload validation error.
+    #[error(transparent)]
+    Other(Box<dyn error::Error + Send + Sync>),
+}
+
+impl NewPayloadError {
+    /// Creates instance of variant [`NewPayloadError::Other`].
+    #[inline]
+    pub const fn other(err: Box<dyn error::Error + Send + Sync>) -> Self {
+        Self::Other(err)
+    }
+}
+
+impl NewPayloadError {
+    /// Returns `true` if the error is caused by a block hash mismatch.
+    #[inline]
+    pub const fn is_block_hash_mismatch(&self) -> bool {
+        matches!(self, Self::Eth(PayloadError::BlockHash { .. }))
+    }
+
+    /// Returns `true` if the error is caused by invalid block hashes (Cancun).
+    #[inline]
+    pub const fn is_invalid_versioned_hashes(&self) -> bool {
+        matches!(self, Self::Eth(PayloadError::InvalidVersionedHashes))
+    }
+}
+
+impl From<NewPayloadError> for PayloadStatusEnum {
+    fn from(error: NewPayloadError) -> Self {
+        Self::Invalid { validation_error: error.to_string() }
+    }
 }
 
 impl EngineObjectValidationError {
