@@ -1,7 +1,7 @@
 use std::{fmt, io};
 
 use futures::Future;
-use reth_primitives::{Receipt, Receipts};
+use reth_primitives::Receipt;
 use tokio::io::AsyncReadExt;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, FramedRead};
@@ -27,10 +27,10 @@ where
 #[derive(Debug)]
 pub struct ReceiptFileClient<D: ReceiptDecoder> {
     /// The buffered receipts, read from file, as nested lists. One list per block number.
-    pub receipts: Receipts<D::Receipt>,
+    pub receipts: Vec<Vec<D::Receipt>>,
     /// First (lowest) block number read from file.
     pub first_block: u64,
-    /// Total number of receipts. Count of elements in [`Receipts`] flattened.
+    /// Total number of receipts. Count of elements in receipts flattened.
     pub total_receipts: usize,
 }
 
@@ -66,7 +66,7 @@ where
     where
         B: AsyncReadExt + Unpin,
     {
-        let mut receipts = Receipts::default();
+        let mut receipts = Vec::default();
 
         // use with_capacity to make sure the internal buffer contains the entire chunk
         let mut stream = FramedRead::with_capacity(reader, D::default(), num_bytes as usize);
@@ -245,14 +245,12 @@ mod test {
             let MockReceipt { tx_type, status, cumulative_gas_used, logs, block_number: number } =
                 exported_receipt;
 
-            #[allow(clippy::needless_update)]
             let receipt = Receipt {
                 tx_type: TxType::try_from(tx_type.to_be_bytes()[0])
                     .map_err(|err| FileClientError::Rlp(err.into(), vec![tx_type]))?,
                 success: status != 0,
                 cumulative_gas_used,
                 logs,
-                ..Default::default()
             };
 
             Ok(Self { receipt, number })
@@ -386,13 +384,12 @@ mod test {
             .unwrap(),
         };
 
-        // #[allow(clippy::needless_update)] not recognised, ..Default::default() needed so optimism
         // feature must not be brought into scope
         let mut receipt = Receipt {
             tx_type: TxType::Legacy,
             success: true,
             cumulative_gas_used: 202819,
-            ..Default::default()
+            logs: vec![],
         };
         receipt.logs = vec![log_1, log_2, log_3];
 
@@ -438,13 +435,11 @@ mod test {
             .unwrap(),
         };
 
-        // #[allow(clippy::needless_update)] not recognised, ..Default::default() needed so optimism
-        // feature must not be brought into scope
         let mut receipt = Receipt {
             tx_type: TxType::Legacy,
             success: true,
             cumulative_gas_used: 116237,
-            ..Default::default()
+            logs: vec![],
         };
         receipt.logs = vec![log_1, log_2];
 
@@ -490,8 +485,6 @@ mod test {
             .unwrap(),
         };
 
-        // #[allow(clippy::needless_update)] not recognised, ..Default::default() needed so optimism
-        // feature must not be brought into scope
         let mut receipt = Receipt {
             tx_type: TxType::Legacy,
             success: true,
@@ -528,7 +521,6 @@ mod test {
     }
 
     #[test]
-    #[allow(clippy::needless_update)]
     fn receipts_codec() {
         // rig
 

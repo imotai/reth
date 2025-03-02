@@ -11,9 +11,7 @@ use parking_lot::RwLock;
 use reth_chainspec::ChainInfo;
 use reth_execution_types::{Chain, ExecutionOutcome};
 use reth_metrics::{metrics::Gauge, Metrics};
-use reth_primitives::{
-    EthPrimitives, NodePrimitives, Receipts, RecoveredBlock, SealedBlock, SealedHeader,
-};
+use reth_primitives::{EthPrimitives, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
 use reth_primitives_traits::{BlockBody as _, SignedTransaction};
 use reth_storage_api::StateProviderBox;
 use reth_trie::{updates::TrieUpdates, HashedPostState};
@@ -648,7 +646,7 @@ impl<N: NodePrimitives> BlockState<N> {
     }
 
     /// Returns the `Receipts` of executed block that determines the state.
-    pub fn receipts(&self) -> &Receipts<N::Receipt> {
+    pub fn receipts(&self) -> &Vec<Vec<N::Receipt>> {
         &self.block.execution_outcome().receipts
     }
 
@@ -660,12 +658,12 @@ impl<N: NodePrimitives> BlockState<N> {
         let receipts = self.receipts();
 
         debug_assert!(
-            receipts.receipt_vec.len() <= 1,
+            receipts.len() <= 1,
             "Expected at most one block's worth of receipts, found {}",
-            receipts.receipt_vec.len()
+            receipts.len()
         );
 
-        receipts.receipt_vec.first().cloned().unwrap_or_default()
+        receipts.first().cloned().unwrap_or_default()
     }
 
     /// Returns a vector of __parent__ `BlockStates`.
@@ -849,6 +847,12 @@ impl<N: NodePrimitives> ExecutedBlockWithTrieUpdates<N> {
     pub fn trie_updates(&self) -> &TrieUpdates {
         &self.trie
     }
+
+    /// Converts the value into [`SealedBlock`].
+    pub fn into_sealed_block(self) -> SealedBlock<N::Block> {
+        let block = Arc::unwrap_or_clone(self.block.recovered_block);
+        block.into_sealed_block()
+    }
 }
 
 /// Non-empty chain of blocks.
@@ -940,9 +944,7 @@ mod tests {
     use super::*;
     use crate::test_utils::TestBlockBuilder;
     use alloy_eips::eip7685::Requests;
-    use alloy_primitives::{
-        map::B256HashMap, Address, BlockNumber, Bytes, StorageKey, StorageValue,
-    };
+    use alloy_primitives::{map::B256Map, Address, BlockNumber, Bytes, StorageKey, StorageValue};
     use rand::Rng;
     use reth_errors::ProviderResult;
     use reth_primitives::{Account, Bytecode, EthPrimitives, Receipt};
@@ -1047,7 +1049,7 @@ mod tests {
     }
 
     impl HashedPostStateProvider for MockStateProvider {
-        fn hashed_post_state(&self, _bundle_state: &revm::db::BundleState) -> HashedPostState {
+        fn hashed_post_state(&self, _bundle_state: &revm_database::BundleState) -> HashedPostState {
             HashedPostState::default()
         }
     }
@@ -1102,7 +1104,7 @@ mod tests {
             &self,
             _input: TrieInput,
             _target: HashedPostState,
-        ) -> ProviderResult<B256HashMap<Bytes>> {
+        ) -> ProviderResult<B256Map<Bytes>> {
             Ok(HashMap::default())
         }
     }
@@ -1244,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_state_receipts() {
-        let receipts = Receipts { receipt_vec: vec![vec![Receipt::default()]] };
+        let receipts = vec![vec![Receipt::default()]];
         let mut test_block_builder: TestBlockBuilder = TestBlockBuilder::default();
         let block =
             test_block_builder.get_executed_block_with_receipts(receipts.clone(), B256::random());
@@ -1532,7 +1534,7 @@ mod tests {
             test_block_builder.get_executed_block_with_number(2, block1.recovered_block.hash());
 
         let sample_execution_outcome = ExecutionOutcome {
-            receipts: Receipts::from_iter([vec![], vec![]]),
+            receipts: vec![vec![], vec![]],
             requests: vec![Requests::default(), Requests::default()],
             ..Default::default()
         };

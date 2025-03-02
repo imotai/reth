@@ -85,7 +85,7 @@ impl Receipt {
     /// Calculates the receipt root for a header for the reference type of [Receipt].
     ///
     /// NOTE: Prefer `proofs::calculate_receipt_root` if you have log blooms memoized.
-    pub fn calculate_receipt_root_no_memo(receipts: &[&Self]) -> B256 {
+    pub fn calculate_receipt_root_no_memo(receipts: &[Self]) -> B256 {
         ordered_trie_root_with_encoder(receipts, |r, buf| r.with_bloom_ref().encode_2718(buf))
     }
 }
@@ -192,6 +192,19 @@ impl InMemorySize for Receipt {
 }
 
 impl reth_primitives_traits::Receipt for Receipt {}
+
+#[cfg(feature = "serde-bincode-compat")]
+impl reth_primitives_traits::serde_bincode_compat::SerdeBincodeCompat for Receipt {
+    type BincodeRepr<'a> = alloc::borrow::Cow<'a, Self>;
+
+    fn as_repr(&self) -> Self::BincodeRepr<'_> {
+        alloc::borrow::Cow::Borrowed(self)
+    }
+
+    fn from_repr(repr: Self::BincodeRepr<'_>) -> Self {
+        repr.into_owned()
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,10 +1,8 @@
 use crate::tree::metrics::BlockBufferMetrics;
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockHash, BlockNumber};
-use reth_primitives::RecoveredBlock;
-use reth_primitives_traits::Block;
-use schnellru::{ByLength, LruMap};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use reth_primitives_traits::{Block, RecoveredBlock};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Contains the tree of pending blocks that cannot be executed due to missing parent.
 /// It allows to store unconnected blocks for potential future inclusion.
@@ -18,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// Note: Buffer is limited by number of blocks that it can contain and eviction of the block
 /// is done by last recently used block.
 #[derive(Debug)]
-pub(super) struct BlockBuffer<B: Block> {
+pub struct BlockBuffer<B: Block> {
     /// All blocks in the buffer stored by their block hash.
     pub(crate) blocks: HashMap<BlockHash, RecoveredBlock<B>>,
     /// Map of any parent block hash (even the ones not currently in the buffer)
@@ -28,34 +26,35 @@ pub(super) struct BlockBuffer<B: Block> {
     /// `BTreeMap` tracking the earliest blocks by block number.
     /// Used for removal of old blocks that precede finalization.
     pub(crate) earliest_blocks: BTreeMap<BlockNumber, HashSet<BlockHash>>,
-    /// LRU used for tracing oldest inserted blocks that are going to be
-    /// first in line for evicting if `max_blocks` limit is hit.
-    ///
-    /// Used as counter of amount of blocks inside buffer.
-    pub(crate) lru: LruMap<BlockHash, ()>,
+    /// FIFO queue tracking block insertion order for eviction.
+    /// When the buffer reaches its capacity limit, the oldest block is evicted first.
+    pub(crate) block_queue: VecDeque<BlockHash>,
+    /// Maximum number of blocks that can be stored in the buffer
+    pub(crate) max_blocks: usize,
     /// Various metrics for the block buffer.
     pub(crate) metrics: BlockBufferMetrics,
 }
 
 impl<B: Block> BlockBuffer<B> {
     /// Create new buffer with max limit of blocks
-    pub(super) fn new(limit: u32) -> Self {
+    pub fn new(limit: u32) -> Self {
         Self {
             blocks: Default::default(),
             parent_to_child: Default::default(),
             earliest_blocks: Default::default(),
-            lru: LruMap::new(ByLength::new(limit)),
+            block_queue: VecDeque::default(),
+            max_blocks: limit as usize,
             metrics: Default::default(),
         }
     }
 
     /// Return reference to the requested block.
-    pub(super) fn block(&self, hash: &BlockHash) -> Option<&RecoveredBlock<B>> {
+    pub fn block(&self, hash: &BlockHash) -> Option<&RecoveredBlock<B>> {
         self.blocks.get(hash)
     }
 
     /// Return a reference to the lowest ancestor of the given block in the buffer.
-    pub(super) fn lowest_ancestor(&self, hash: &BlockHash) -> Option<&RecoveredBlock<B>> {
+    pub fn lowest_ancestor(&self, hash: &BlockHash) -> Option<&RecoveredBlock<B>> {
         let mut current_block = self.blocks.get(hash)?;
         while let Some(parent) = self.blocks.get(&current_block.parent_hash()) {
             current_block = parent;
@@ -64,33 +63,24 @@ impl<B: Block> BlockBuffer<B> {
     }
 
     /// Insert a correct block inside the buffer.
-    pub(super) fn insert_block(&mut self, block: RecoveredBlock<B>) {
+    pub fn insert_block(&mut self, block: RecoveredBlock<B>) {
         let hash = block.hash();
 
         self.parent_to_child.entry(block.parent_hash()).or_default().insert(hash);
         self.earliest_blocks.entry(block.number()).or_default().insert(hash);
         self.blocks.insert(hash, block);
 
-        if let Some(evicted_hash) = self.insert_hash_and_get_evicted(hash) {
-            // evict the block if limit is hit
-            if let Some(evicted_block) = self.remove_block(&evicted_hash) {
-                // evict the block if limit is hit
-                self.remove_from_parent(evicted_block.parent_hash(), &evicted_hash);
+        // Add block to FIFO queue and handle eviction if needed
+        if self.block_queue.len() >= self.max_blocks {
+            // Evict oldest block if limit is hit
+            if let Some(evicted_hash) = self.block_queue.pop_front() {
+                if let Some(evicted_block) = self.remove_block(&evicted_hash) {
+                    self.remove_from_parent(evicted_block.parent_hash(), &evicted_hash);
+                }
             }
         }
+        self.block_queue.push_back(hash);
         self.metrics.blocks.set(self.blocks.len() as f64);
-    }
-
-    /// Inserts the hash and returns the oldest evicted hash if any.
-    fn insert_hash_and_get_evicted(&mut self, entry: BlockHash) -> Option<BlockHash> {
-        let new = self.lru.peek(&entry).is_none();
-        let evicted = if new && self.lru.limiter().max_length() as usize <= self.lru.len() {
-            self.lru.pop_oldest().map(|(k, ())| k)
-        } else {
-            None
-        };
-        self.lru.get_or_insert(entry, || ());
-        evicted
     }
 
     /// Removes the given block from the buffer and also all the children of the block.
@@ -99,7 +89,7 @@ impl<B: Block> BlockBuffer<B> {
     ///
     /// Note: that order of returned blocks is important and the blocks with lower block number
     /// in the chain will come first so that they can be executed in the correct order.
-    pub(super) fn remove_block_with_children(
+    pub fn remove_block_with_children(
         &mut self,
         parent_hash: &BlockHash,
     ) -> Vec<RecoveredBlock<B>> {
@@ -113,7 +103,7 @@ impl<B: Block> BlockBuffer<B> {
     }
 
     /// Discard all blocks that precede block number from the buffer.
-    pub(super) fn remove_old_blocks(&mut self, block_number: BlockNumber) {
+    pub fn remove_old_blocks(&mut self, block_number: BlockNumber) {
         let mut block_hashes_to_remove = Vec::new();
 
         // discard all blocks that are before the finalized number.
@@ -165,7 +155,7 @@ impl<B: Block> BlockBuffer<B> {
         let block = self.blocks.remove(hash)?;
         self.remove_from_earliest_blocks(block.number(), hash);
         self.remove_from_parent(block.parent_hash(), hash);
-        self.lru.remove(hash);
+        self.block_queue.retain(|h| h != hash);
         Some(block)
     }
 
@@ -196,7 +186,7 @@ mod tests {
     use super::*;
     use alloy_eips::BlockNumHash;
     use alloy_primitives::BlockHash;
-    use reth_primitives::RecoveredBlock;
+    use reth_primitives_traits::RecoveredBlock;
     use reth_testing_utils::generators::{self, random_block, BlockParams, Rng};
     use std::collections::HashMap;
 
@@ -205,7 +195,7 @@ mod tests {
         rng: &mut R,
         number: u64,
         parent: BlockHash,
-    ) -> RecoveredBlock<reth_primitives::Block> {
+    ) -> RecoveredBlock<reth_ethereum_primitives::Block> {
         let block =
             random_block(rng, number, BlockParams { parent: Some(parent), ..Default::default() });
         block.try_recover().unwrap()
@@ -214,7 +204,7 @@ mod tests {
     /// Assert that all buffer collections have the same data length.
     fn assert_buffer_lengths<B: Block>(buffer: &BlockBuffer<B>, expected: usize) {
         assert_eq!(buffer.blocks.len(), expected);
-        assert_eq!(buffer.lru.len(), expected);
+        assert_eq!(buffer.block_queue.len(), expected);
         assert_eq!(
             buffer.parent_to_child.iter().fold(0, |acc, (_, hashes)| acc + hashes.len()),
             expected
@@ -228,7 +218,7 @@ mod tests {
     /// Assert that the block was removed from all buffer collections.
     fn assert_block_removal<B: Block>(
         buffer: &BlockBuffer<B>,
-        block: &RecoveredBlock<reth_primitives::Block>,
+        block: &RecoveredBlock<reth_ethereum_primitives::Block>,
     ) {
         assert!(!buffer.blocks.contains_key(&block.hash()));
         assert!(buffer
