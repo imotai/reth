@@ -17,8 +17,7 @@ use alloy_primitives::{
 };
 use reth_chain_state::{BlockState, CanonicalInMemoryState, MemoryOverlayStateProviderRef};
 use reth_chainspec::{ChainInfo, EthereumHardforks};
-use reth_db::models::BlockNumberAddress;
-use reth_db_api::models::{AccountBeforeTx, StoredBlockBodyIndices};
+use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
 use reth_execution_types::{BundleStateInit, ExecutionOutcome, RevertsInit};
 use reth_node_types::{BlockTy, HeaderTy, ReceiptTy, TxTy};
 use reth_primitives::{Account, RecoveredBlock, SealedBlock, SealedHeader, StorageEntry};
@@ -30,7 +29,7 @@ use reth_storage_api::{
     StateProvider, StorageChangeSetReader,
 };
 use reth_storage_errors::provider::ProviderResult;
-use revm::db::states::PlainStorageRevert;
+use revm_database::states::PlainStorageRevert;
 use std::{
     ops::{Add, Bound, RangeBounds, RangeInclusive, Sub},
     sync::Arc,
@@ -208,7 +207,7 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
             reverts,
             // We skip new contracts since we never delete them from the database
             Vec::new(),
-            receipts.into(),
+            receipts,
             start_block_number,
             Vec::new(),
         )))
@@ -796,20 +795,25 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
         hash: B256,
         source: BlockSource,
     ) -> ProviderResult<Option<Self::Block>> {
-        match source {
-            BlockSource::Any | BlockSource::Canonical => {
-                // Note: it's fine to return the unsealed block because the caller already has
-                // the hash
-                self.get_in_memory_or_storage_by_block(
-                    hash.into(),
-                    |db_provider| db_provider.find_block_by_hash(hash, source),
-                    |block_state| Ok(Some(block_state.block_ref().recovered_block().clone_block())),
-                )
-            }
-            BlockSource::Pending => {
-                Ok(self.canonical_in_memory_state.pending_block().map(|block| block.into_block()))
+        if matches!(source, BlockSource::Canonical | BlockSource::Any) {
+            if let Some(block) = self.get_in_memory_or_storage_by_block(
+                hash.into(),
+                |db_provider| db_provider.find_block_by_hash(hash, BlockSource::Canonical),
+                |block_state| Ok(Some(block_state.block_ref().recovered_block().clone_block())),
+            )? {
+                return Ok(Some(block))
             }
         }
+
+        if matches!(source, BlockSource::Pending | BlockSource::Any) {
+            return Ok(self
+                .canonical_in_memory_state
+                .pending_block()
+                .filter(|b| b.hash() == hash)
+                .map(|b| b.into_block()))
+        }
+
+        Ok(None)
     }
 
     fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
@@ -1480,14 +1484,14 @@ mod tests {
     use itertools::Itertools;
     use rand::Rng;
     use reth_chain_state::{ExecutedBlock, ExecutedBlockWithTrieUpdates, NewCanonicalChain};
-    use reth_db::models::AccountBeforeTx;
+    use reth_db_api::models::AccountBeforeTx;
     use reth_execution_types::ExecutionOutcome;
     use reth_primitives::{RecoveredBlock, SealedBlock};
     use reth_storage_api::{BlockReader, BlockSource, ChangeSetReader};
     use reth_testing_utils::generators::{
         self, random_block_range, random_changeset_range, random_eoa_accounts, BlockRangeParams,
     };
-    use revm::db::BundleState;
+    use revm_database::BundleState;
     use std::{
         ops::{Bound, Range, RangeBounds},
         sync::Arc,

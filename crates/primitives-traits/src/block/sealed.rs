@@ -421,7 +421,7 @@ pub(super) mod serde_bincode_compat {
         From<&'a super::SealedBlock<T>> for SealedBlock<'a, T>
     {
         fn from(value: &'a super::SealedBlock<T>) -> Self {
-            Self { header: (&value.header).into(), body: (&value.body).into() }
+            Self { header: value.header.as_repr(), body: value.body.as_repr() }
         }
     }
 
@@ -429,7 +429,7 @@ pub(super) mod serde_bincode_compat {
         From<SealedBlock<'a, T>> for super::SealedBlock<T>
     {
         fn from(value: SealedBlock<'a, T>) -> Self {
-            Self::from_sealed_parts(value.header.into(), value.body.into())
+            Self::from_sealed_parts(value.header.into(), SerdeBincodeCompat::from_repr(value.body))
         }
     }
 
@@ -459,5 +459,13 @@ pub(super) mod serde_bincode_compat {
         SerdeBincodeCompat for super::SealedBlock<T>
     {
         type BincodeRepr<'a> = SealedBlock<'a, T>;
+
+        fn as_repr(&self) -> Self::BincodeRepr<'_> {
+            self.into()
+        }
+
+        fn from_repr(repr: Self::BincodeRepr<'_>) -> Self {
+            repr.into()
+        }
     }
 }

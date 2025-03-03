@@ -6,19 +6,18 @@ use alloy_primitives::U256;
 use alloy_rpc_types_eth::{state::StateOverride, transaction::TransactionRequest, BlockId};
 use futures::Future;
 use reth_chainspec::MIN_TRANSACTION_GAS;
-use reth_evm::{env::EvmEnv, ConfigureEvmEnv, TransactionEnv};
+use reth_errors::ProviderError;
+use reth_evm::{ConfigureEvmEnv, Database, EvmEnv, TransactionEnv};
 use reth_provider::StateProvider;
-use reth_revm::{
-    database::StateProviderDatabase,
-    db::CacheDB,
-    primitives::{ExecutionResult, HaltReason},
-};
+use reth_revm::{database::StateProviderDatabase, db::CacheDB};
 use reth_rpc_eth_types::{
+    error::api::FromEvmHalt,
     revm_utils::{apply_state_overrides, caller_gas_allowance},
     EthApiError, RevertError, RpcInvalidTransactionError,
 };
 use reth_rpc_server_types::constants::gas_oracle::{CALL_STIPEND_GAS, ESTIMATE_GAS_ERROR_RATIO};
-use revm_primitives::{db::Database, TxKind};
+use revm::context_interface::{result::ExecutionResult, Transaction};
+use revm_primitives::TxKind;
 use tracing::trace;
 
 /// Gas execution estimates
@@ -57,7 +56,7 @@ pub trait EstimateCall: Call {
         request.nonce = None;
 
         // Keep a copy of gas related request values
-        let tx_request_gas_limit = request.gas.map(U256::from);
+        let tx_request_gas_limit = request.gas;
         let tx_request_gas_price = request.gas_price;
         // the gas limit of the corresponding block
         let block_env_gas_limit = evm_env.block_env.gas_limit;
@@ -75,8 +74,8 @@ pub trait EstimateCall: Call {
             .unwrap_or(block_env_gas_limit);
 
         // Configure the evm env
-        let mut tx_env = self.create_txn_env(&evm_env.block_env, request)?;
         let mut db = CacheDB::new(StateProviderDatabase::new(state));
+        let mut tx_env = self.create_txn_env(&evm_env, request, &mut db)?;
 
         // Apply any state overrides if specified.
         if let Some(state_override) = state_override {
@@ -109,14 +108,11 @@ pub trait EstimateCall: Call {
         // Check funds of the sender (only useful to check if transaction gas price is more than 0).
         //
         // The caller allowance is check by doing `(account.balance - tx.value) / tx.gas_price`
-        if tx_env.gas_price() > U256::ZERO {
+        if tx_env.gas_price() > 0 {
             // cap the highest gas limit by max gas caller can afford with given gas price
             highest_gas_limit = highest_gas_limit
                 .min(caller_gas_allowance(&mut db, &tx_env).map_err(Self::Error::from_eth_err)?);
         }
-
-        // We can now normalize the highest gas limit to a u64
-        let mut highest_gas_limit = highest_gas_limit.saturating_to::<u64>();
 
         // If the provided gas limit is less than computed cap, use that
         tx_env.set_gas_limit(tx_env.gas_limit().min(highest_gas_limit));
@@ -141,16 +137,26 @@ pub trait EstimateCall: Call {
                         &mut db,
                     ))
                 }
+                Err(err) if err.is_gas_too_low() => {
+                    // This failed because the configured gas cost of the tx was lower than what
+                    // actually consumed by the tx This can happen if the
+                    // request provided fee values manually and the resulting gas cost exceeds the
+                    // sender's allowance, so we return the appropriate error here
+                    return Err(RpcInvalidTransactionError::GasRequiredExceedsAllowance {
+                        gas_limit: tx_env.gas_limit(),
+                    }
+                    .into_eth_err())
+                }
                 // Propagate other results (successful or other errors).
                 ethres => ethres?,
             };
 
         let gas_refund = match res.result {
             ExecutionResult::Success { gas_refunded, .. } => gas_refunded,
-            ExecutionResult::Halt { reason, gas_used } => {
+            ExecutionResult::Halt { reason, .. } => {
                 // here we don't check for invalid opcode because already executed with highest gas
                 // limit
-                return Err(RpcInvalidTransactionError::halt(reason, gas_used).into_eth_err())
+                return Err(Self::Error::from_evm_halt(reason, tx_env.gas_limit()))
             }
             ExecutionResult::Revert { output, .. } => {
                 // if price or limit was included in the request then we can execute the request
@@ -280,17 +286,17 @@ pub trait EstimateCall: Call {
     #[inline]
     fn map_out_of_gas_err<DB>(
         &self,
-        env_gas_limit: U256,
+        env_gas_limit: u64,
         evm_env: EvmEnv<<Self::Evm as ConfigureEvmEnv>::Spec>,
         mut tx_env: <Self::Evm as ConfigureEvmEnv>::TxEnv,
         db: &mut DB,
     ) -> Self::Error
     where
-        DB: Database,
+        DB: Database<Error = ProviderError>,
         EthApiError: From<DB::Error>,
     {
         let req_gas_limit = tx_env.gas_limit();
-        tx_env.set_gas_limit(env_gas_limit.try_into().unwrap_or(u64::MAX));
+        tx_env.set_gas_limit(env_gas_limit);
         let (res, _) = match self.transact(db, evm_env, tx_env) {
             Ok(res) => res,
             Err(err) => return err,
@@ -306,7 +312,7 @@ pub trait EstimateCall: Call {
                 RpcInvalidTransactionError::Revert(RevertError::new(output)).into_eth_err()
             }
             ExecutionResult::Halt { reason, .. } => {
-                RpcInvalidTransactionError::EvmHalt(reason).into_eth_err()
+                Self::Error::from_evm_halt(reason, req_gas_limit)
             }
         }
     }
@@ -318,8 +324,8 @@ pub trait EstimateCall: Call {
 /// gas limit for a transaction. It adjusts the highest or lowest gas limits depending on
 /// whether the execution succeeded, reverted, or halted due to specific reasons.
 #[inline]
-pub fn update_estimated_gas_range(
-    result: ExecutionResult,
+pub fn update_estimated_gas_range<Halt>(
+    result: ExecutionResult<Halt>,
     tx_gas_limit: u64,
     highest_gas_limit: &mut u64,
     lowest_gas_limit: &mut u64,
@@ -329,31 +335,16 @@ pub fn update_estimated_gas_range(
             // Cap the highest gas limit with the succeeding gas limit.
             *highest_gas_limit = tx_gas_limit;
         }
-        ExecutionResult::Revert { .. } => {
-            // Increase the lowest gas limit.
+        ExecutionResult::Revert { .. } | ExecutionResult::Halt { .. } => {
+            // We know that transaction succeeded with a higher gas limit before, so any failure
+            // means that we need to increase it.
+            //
+            // We are ignoring all halts here, and not just OOG errors because there are cases when
+            // non-OOG halt might flag insufficient gas limit as well.
+            //
+            // Common usage of invalid opcode in OpenZeppelin:
+            // <https://github.com/OpenZeppelin/openzeppelin-contracts/blob/94697be8a3f0dfcd95dfb13ffbd39b5973f5c65d/contracts/metatx/ERC2771Forwarder.sol#L360-L367>
             *lowest_gas_limit = tx_gas_limit;
-        }
-        ExecutionResult::Halt { reason, .. } => {
-            match reason {
-                HaltReason::OutOfGas(_) | HaltReason::InvalidFEOpcode => {
-                    // Both `OutOfGas` and `InvalidEFOpcode` can occur dynamically if the gas
-                    // left is too low. Treat this as an out of gas
-                    // condition, knowing that the call succeeds with a
-                    // higher gas limit.
-                    //
-                    // Common usage of invalid opcode in OpenZeppelin:
-                    // <https://github.com/OpenZeppelin/openzeppelin-contracts/blob/94697be8a3f0dfcd95dfb13ffbd39b5973f5c65d/contracts/metatx/ERC2771Forwarder.sol#L360-L367>
-
-                    // Increase the lowest gas limit.
-                    *lowest_gas_limit = tx_gas_limit;
-                }
-                err => {
-                    // These cases should be unreachable because we know the transaction
-                    // succeeds, but if they occur, treat them as an
-                    // error.
-                    return Err(RpcInvalidTransactionError::EvmHalt(err).into_eth_err())
-                }
-            }
         }
     };
 
