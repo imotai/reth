@@ -9,32 +9,27 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types::engine::{BlobsBundleV1, PayloadAttributes};
 use clap::Parser;
 use eyre::Context;
-use reth_basic_payload_builder::{
-    BuildArguments, BuildOutcome, Cancelled, PayloadBuilder, PayloadConfig,
-};
-use reth_chainspec::ChainSpec;
+use reth_basic_payload_builder::{BuildArguments, BuildOutcome, PayloadBuilder, PayloadConfig};
+use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_commands::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
 use reth_cli_runner::CliContext;
 use reth_consensus::{Consensus, FullConsensus};
 use reth_errors::{ConsensusError, RethResult};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
+use reth_ethereum_primitives::{EthPrimitives, Transaction, TransactionSigned};
 use reth_evm::execute::{BlockExecutorProvider, Executor};
 use reth_execution_types::ExecutionOutcome;
 use reth_fs_util as fs;
 use reth_node_api::{BlockTy, EngineApiMessageVersion, PayloadBuilderAttributes};
 use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig, EthExecutorProvider};
-use reth_primitives::{
-    transaction::SignedTransactionIntoRecoveredExt, EthPrimitives, SealedBlock, SealedHeader,
-    Transaction, TransactionSigned,
-};
-use reth_primitives_traits::{Block as _, SignedTransaction};
+use reth_primitives_traits::{Block as _, SealedBlock, SealedHeader, SignedTransaction};
 use reth_provider::{
     providers::{BlockchainProvider, ProviderNodeTypes},
     BlockHashReader, BlockReader, BlockWriter, ChainSpecProvider, ProviderFactory,
     StageCheckpointReader, StateProviderFactory,
 };
-use reth_revm::{cached::CachedReads, database::StateProviderDatabase, primitives::KzgSettings};
+use reth_revm::{cached::CachedReads, cancelled::CancelOnDrop, database::StateProviderDatabase};
 use reth_stages::StageId;
 use reth_transaction_pool::{
     blobstore::InMemoryBlobStore, BlobStore, EthPooledTransaction, PoolConfig, TransactionOrigin,
@@ -81,7 +76,7 @@ pub struct Command<C: ChainSpecParser> {
 }
 
 impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
-    /// Fetches the best block block from the database.
+    /// Fetches the best block from the database.
     ///
     /// If the database is empty, returns the genesis block.
     fn lookup_best_block<N: ProviderNodeTypes<ChainSpec = C::ChainSpec>>(
@@ -108,11 +103,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
     /// `EnvKzgSettings::Default`.
     fn kzg_settings(&self) -> eyre::Result<EnvKzgSettings> {
         if let Some(ref trusted_setup_file) = self.trusted_setup_file {
-            let trusted_setup = KzgSettings::load_trusted_setup_file(trusted_setup_file)
-                .wrap_err_with(|| {
-                    format!("Failed to load trusted setup file: {:?}", trusted_setup_file)
-                })?;
-            Ok(EnvKzgSettings::Custom(Arc::new(trusted_setup)))
+            EnvKzgSettings::load_from_trusted_setup_file(trusted_setup_file).wrap_err_with(|| {
+                format!("Failed to load trusted setup file: {:?}", trusted_setup_file)
+            })
         } else {
             Ok(EnvKzgSettings::Default)
         }
@@ -125,7 +118,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
     ) -> eyre::Result<()> {
         let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RW)?;
 
-        let consensus: Arc<dyn FullConsensus<Error = ConsensusError>> =
+        let consensus: Arc<dyn FullConsensus<EthPrimitives, Error = ConsensusError>> =
             Arc::new(EthBeaconConsensus::new(provider_factory.chain_spec()));
 
         // fetch the best block from the database
@@ -136,16 +129,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let blockchain_db = BlockchainProvider::new(provider_factory.clone())?;
         let blob_store = InMemoryBlobStore::default();
 
-        let validator =
-            TransactionValidationTaskExecutor::eth_builder(provider_factory.chain_spec())
-                .with_head_timestamp(best_block.timestamp)
-                .kzg_settings(self.kzg_settings()?)
-                .with_additional_tasks(1)
-                .build_with_tasks(
-                    blockchain_db.clone(),
-                    ctx.task_executor.clone(),
-                    blob_store.clone(),
-                );
+        let validator = TransactionValidationTaskExecutor::eth_builder(blockchain_db.clone())
+            .with_head_timestamp(best_block.timestamp)
+            .kzg_settings(self.kzg_settings()?)
+            .with_additional_tasks(1)
+            .build_with_tasks(ctx.task_executor.clone(), blob_store.clone());
 
         let transaction_pool = reth_transaction_pool::Pool::eth_pool(
             validator,
@@ -169,7 +157,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                 .try_clone_into_recovered()
                 .map_err(|e| eyre::eyre!("failed to recover tx: {e}"))?;
 
-            let encoded_length = match &transaction.transaction {
+            let encoded_length = match transaction.transaction() {
                 Transaction::Eip4844(TxEip4844 { blob_versioned_hashes, .. }) => {
                     let blobs_bundle = blobs_bundle.as_mut().ok_or_else(|| {
                         eyre::eyre!("encountered a blob tx. `--blobs-bundle-path` must be provided")
@@ -180,7 +168,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
 
                     let pooled = transaction
                         .clone()
-                        .into_tx()
+                        .into_inner()
                         .try_into_pooled_eip4844(sidecar.clone())
                         .expect("should not fail to convert blob tx if it is already eip4844");
                     let encoded_length = pooled.encode_2718_len();
@@ -207,8 +195,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             prev_randao: self.prev_randao,
             timestamp: self.timestamp,
             suggested_fee_recipient: self.suggested_fee_recipient,
-            // TODO: add support for withdrawals
-            withdrawals: None,
+            // Set empty withdrawals vector if Shanghai is active, None otherwise
+            withdrawals: provider_factory
+                .chain_spec()
+                .is_shanghai_active_at_timestamp(self.timestamp)
+                .then(Vec::new),
         };
         let payload_config = PayloadConfig::new(
             Arc::new(SealedHeader::new(best_block.header().clone(), best_block.hash())),
@@ -220,17 +211,17 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         );
 
         let args = BuildArguments::new(
-            blockchain_db.clone(),
-            transaction_pool,
             CachedReads::default(),
             payload_config,
-            Cancelled::default(),
+            CancelOnDrop::default(),
             None,
         );
 
         let payload_builder = reth_ethereum_payload_builder::EthereumPayloadBuilder::new(
+            blockchain_db.clone(),
+            transaction_pool,
             EthEvmConfig::new(provider_factory.chain_spec()),
-            EthereumBuilderConfig::new(Default::default()),
+            EthereumBuilderConfig::new(),
         );
 
         match payload_builder.try_build(args)? {

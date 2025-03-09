@@ -11,13 +11,23 @@
 
 extern crate alloc;
 
-use reth_payload_primitives::{BuiltPayload, PayloadAttributes};
-mod error;
-
-use core::fmt;
-
 use alloy_consensus::BlockHeader;
-use alloy_rpc_types_engine::{ExecutionPayload, ExecutionPayloadSidecar, PayloadError};
+use alloy_eips::eip7685::Requests;
+use reth_errors::ConsensusError;
+use reth_payload_primitives::{
+    validate_execution_requests, BuiltPayload, EngineApiMessageVersion,
+    EngineObjectValidationError, InvalidPayloadAttributesError, NewPayloadError, PayloadAttributes,
+    PayloadOrAttributes, PayloadTypes,
+};
+use reth_primitives::{NodePrimitives, RecoveredBlock, SealedBlock};
+use reth_primitives_traits::Block;
+use reth_trie_common::HashedPostState;
+use serde::{de::DeserializeOwned, Serialize};
+
+// Re-export [`ExecutionPayload`] moved to `reth_payload_primitives`
+pub use reth_payload_primitives::ExecutionPayload;
+
+mod error;
 pub use error::*;
 
 mod forkchoice;
@@ -31,16 +41,6 @@ pub use event::*;
 
 mod invalid_block_hook;
 pub use invalid_block_hook::InvalidBlockHook;
-
-use reth_payload_primitives::{
-    validate_execution_requests, EngineApiMessageVersion, EngineObjectValidationError,
-    InvalidPayloadAttributesError, PayloadOrAttributes, PayloadTypes,
-};
-use reth_primitives::{NodePrimitives, SealedBlock};
-use reth_primitives_traits::Block;
-use serde::{de::DeserializeOwned, ser::Serialize};
-
-use alloy_eips::eip7685::Requests;
 
 /// This type defines the versioned types of the engine API.
 ///
@@ -88,19 +88,25 @@ pub trait EngineTypes:
         + Send
         + Sync
         + 'static;
+    /// Execution data.
+    type ExecutionData: ExecutionPayload;
 
-    /// Converts a [`BuiltPayload`] into an [`ExecutionPayload`] and [`ExecutionPayloadSidecar`].
+    /// Converts a [`BuiltPayload`] into an [`Self::ExecutionData`].
     fn block_to_payload(
         block: SealedBlock<
             <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
         >,
-    ) -> (ExecutionPayload, ExecutionPayloadSidecar);
+    ) -> Self::ExecutionData;
 }
 
 /// Type that validates an [`ExecutionPayload`].
-pub trait PayloadValidator: fmt::Debug + Send + Sync + Unpin + 'static {
+#[auto_impl::auto_impl(&, Arc)]
+pub trait PayloadValidator: Send + Sync + Unpin + 'static {
     /// The block type used by the engine.
     type Block: Block;
+
+    /// The execution payload type used by the engine.
+    type ExecutionData;
 
     /// Ensures that the given payload does not violate any consensus rules that concern the block's
     /// layout.
@@ -112,13 +118,24 @@ pub trait PayloadValidator: fmt::Debug + Send + Sync + Unpin + 'static {
     /// engine-API specification.
     fn ensure_well_formed_payload(
         &self,
-        payload: ExecutionPayload,
-        sidecar: ExecutionPayloadSidecar,
-    ) -> Result<SealedBlock<Self::Block>, PayloadError>;
+        payload: Self::ExecutionData,
+    ) -> Result<RecoveredBlock<Self::Block>, NewPayloadError>;
+
+    /// Verifies payload post-execution w.r.t. hashed state updates.
+    fn validate_block_post_execution_with_hashed_state(
+        &self,
+        _state_updates: &HashedPostState,
+        _block: &RecoveredBlock<Self::Block>,
+    ) -> Result<(), ConsensusError> {
+        // method not used by l1
+        Ok(())
+    }
 }
 
 /// Type that validates the payloads processed by the engine.
-pub trait EngineValidator<Types: EngineTypes>: PayloadValidator {
+pub trait EngineValidator<Types: EngineTypes>:
+    PayloadValidator<ExecutionData = Types::ExecutionData>
+{
     /// Validates the execution requests according to [EIP-7685](https://eips.ethereum.org/EIPS/eip-7685).
     fn validate_execution_requests(
         &self,
@@ -132,7 +149,11 @@ pub trait EngineValidator<Types: EngineTypes>: PayloadValidator {
     fn validate_version_specific_fields(
         &self,
         version: EngineApiMessageVersion,
-        payload_or_attrs: PayloadOrAttributes<'_, <Types as PayloadTypes>::PayloadAttributes>,
+        payload_or_attrs: PayloadOrAttributes<
+            '_,
+            Types::ExecutionData,
+            <Types as PayloadTypes>::PayloadAttributes,
+        >,
     ) -> Result<(), EngineObjectValidationError>;
 
     /// Ensures that the payload attributes are valid for the given [`EngineApiMessageVersion`].

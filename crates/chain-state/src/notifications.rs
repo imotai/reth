@@ -217,7 +217,7 @@ mod tests {
     use alloy_consensus::BlockBody;
     use alloy_primitives::{b256, B256};
     use reth_execution_types::ExecutionOutcome;
-    use reth_primitives::{Receipt, Receipts, SealedBlock, TransactionSigned, TxType};
+    use reth_primitives::{Receipt, SealedBlock, TransactionSigned, TxType};
 
     #[test]
     fn test_commit_notification() {
@@ -324,17 +324,15 @@ mod tests {
         block2.set_hash(block2_hash);
 
         // Create a receipt for the transaction in block1.
-        #[allow(clippy::needless_update)]
         let receipt1 = Receipt {
             tx_type: TxType::Legacy,
             cumulative_gas_used: 12345,
             logs: vec![],
             success: true,
-            ..Default::default()
         };
 
         // Wrap the receipt in a `Receipts` structure, as expected in the `ExecutionOutcome`.
-        let receipts = Receipts { receipt_vec: vec![vec![receipt1.clone()]] };
+        let receipts = vec![vec![receipt1.clone()]];
 
         // Define an `ExecutionOutcome` with the created receipts.
         let execution_outcome = ExecutionOutcome { receipts, ..Default::default() };
@@ -359,7 +357,7 @@ mod tests {
                 block: block1.num_hash(),
                 tx_receipts: vec![(
                     // Transaction hash of a Transaction::default()
-                    b256!("20b5378c6fe992c118b557d2f8e8bbe0b7567f6fe5483a8f0f1c51e93a9d91ab"),
+                    b256!("0x20b5378c6fe992c118b557d2f8e8bbe0b7567f6fe5483a8f0f1c51e93a9d91ab"),
                     receipt1
                 )]
             }
@@ -385,15 +383,13 @@ mod tests {
         old_block1.set_hash(B256::new([0x01; 32]));
 
         // Create a receipt for a transaction in the reverted block.
-        #[allow(clippy::needless_update)]
         let old_receipt = Receipt {
             tx_type: TxType::Legacy,
             cumulative_gas_used: 54321,
             logs: vec![],
             success: false,
-            ..Default::default()
         };
-        let old_receipts = Receipts { receipt_vec: vec![vec![old_receipt.clone()]] };
+        let old_receipts = vec![vec![old_receipt.clone()]];
 
         let old_execution_outcome =
             ExecutionOutcome { receipts: old_receipts, ..Default::default() };
@@ -416,15 +412,13 @@ mod tests {
         new_block1.set_hash(B256::new([0x02; 32]));
 
         // Create a receipt for a transaction in the new committed block.
-        #[allow(clippy::needless_update)]
         let new_receipt = Receipt {
             tx_type: TxType::Legacy,
             cumulative_gas_used: 12345,
             logs: vec![],
             success: true,
-            ..Default::default()
         };
-        let new_receipts = Receipts { receipt_vec: vec![vec![new_receipt.clone()]] };
+        let new_receipts = vec![vec![new_receipt.clone()]];
 
         let new_execution_outcome =
             ExecutionOutcome { receipts: new_receipts, ..Default::default() };
@@ -448,7 +442,7 @@ mod tests {
                 block: old_block1.num_hash(),
                 tx_receipts: vec![(
                     // Transaction hash of a Transaction::default()
-                    b256!("20b5378c6fe992c118b557d2f8e8bbe0b7567f6fe5483a8f0f1c51e93a9d91ab"),
+                    b256!("0x20b5378c6fe992c118b557d2f8e8bbe0b7567f6fe5483a8f0f1c51e93a9d91ab"),
                     old_receipt
                 )]
             }
@@ -464,7 +458,7 @@ mod tests {
                 block: new_block1.num_hash(),
                 tx_receipts: vec![(
                     // Transaction hash of a Transaction::default()
-                    b256!("20b5378c6fe992c118b557d2f8e8bbe0b7567f6fe5483a8f0f1c51e93a9d91ab"),
+                    b256!("0x20b5378c6fe992c118b557d2f8e8bbe0b7567f6fe5483a8f0f1c51e93a9d91ab"),
                     new_receipt
                 )]
             }

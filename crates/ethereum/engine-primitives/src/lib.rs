@@ -12,22 +12,16 @@
 extern crate alloc;
 
 mod payload;
-use alloc::sync::Arc;
-use alloy_rpc_types_engine::{ExecutionPayload, ExecutionPayloadSidecar, PayloadError};
+pub use payload::{EthBuiltPayload, EthPayloadBuilderAttributes};
+
+use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload};
 pub use alloy_rpc_types_engine::{
     ExecutionPayloadEnvelopeV2, ExecutionPayloadEnvelopeV3, ExecutionPayloadEnvelopeV4,
     ExecutionPayloadV1, PayloadAttributes as EthPayloadAttributes,
 };
-pub use payload::{EthBuiltPayload, EthPayloadBuilderAttributes};
-use reth_chainspec::ChainSpec;
-use reth_engine_primitives::{EngineTypes, EngineValidator, PayloadValidator};
-use reth_payload_primitives::{
-    validate_version_specific_fields, BuiltPayload, EngineApiMessageVersion,
-    EngineObjectValidationError, PayloadOrAttributes, PayloadTypes,
-};
-use reth_payload_validator::ExecutionPayloadValidator;
-use reth_primitives::{Block, NodePrimitives, SealedBlock};
-use reth_rpc_types_compat::engine::payload::block_to_payload;
+use reth_engine_primitives::EngineTypes;
+use reth_payload_primitives::{BuiltPayload, PayloadTypes};
+use reth_primitives::{NodePrimitives, SealedBlock};
 
 /// The types used in the default mainnet ethereum beacon consensus engine.
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
@@ -51,6 +45,7 @@ where
         + TryInto<ExecutionPayloadEnvelopeV3>
         + TryInto<ExecutionPayloadEnvelopeV4>,
 {
+    type ExecutionData = ExecutionData;
     type ExecutionPayloadEnvelopeV1 = ExecutionPayloadV1;
     type ExecutionPayloadEnvelopeV2 = ExecutionPayloadEnvelopeV2;
     type ExecutionPayloadEnvelopeV3 = ExecutionPayloadEnvelopeV3;
@@ -60,8 +55,10 @@ where
         block: SealedBlock<
             <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
         >,
-    ) -> (ExecutionPayload, ExecutionPayloadSidecar) {
-        block_to_payload(block)
+    ) -> ExecutionData {
+        let (payload, sidecar) =
+            ExecutionPayload::from_block_unchecked(block.hash(), &block.into_block());
+        ExecutionData { payload, sidecar }
     }
 }
 
@@ -74,56 +71,4 @@ impl PayloadTypes for EthPayloadTypes {
     type BuiltPayload = EthBuiltPayload;
     type PayloadAttributes = EthPayloadAttributes;
     type PayloadBuilderAttributes = EthPayloadBuilderAttributes;
-}
-
-/// Validator for the ethereum engine API.
-#[derive(Debug, Clone)]
-pub struct EthereumEngineValidator {
-    inner: ExecutionPayloadValidator<ChainSpec>,
-}
-
-impl EthereumEngineValidator {
-    /// Instantiates a new validator.
-    pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { inner: ExecutionPayloadValidator::new(chain_spec) }
-    }
-
-    /// Returns the chain spec used by the validator.
-    #[inline]
-    fn chain_spec(&self) -> &ChainSpec {
-        self.inner.chain_spec()
-    }
-}
-
-impl PayloadValidator for EthereumEngineValidator {
-    type Block = Block;
-
-    fn ensure_well_formed_payload(
-        &self,
-        payload: ExecutionPayload,
-        sidecar: ExecutionPayloadSidecar,
-    ) -> Result<SealedBlock, PayloadError> {
-        self.inner.ensure_well_formed_payload(payload, sidecar)
-    }
-}
-
-impl<Types> EngineValidator<Types> for EthereumEngineValidator
-where
-    Types: EngineTypes<PayloadAttributes = EthPayloadAttributes>,
-{
-    fn validate_version_specific_fields(
-        &self,
-        version: EngineApiMessageVersion,
-        payload_or_attrs: PayloadOrAttributes<'_, EthPayloadAttributes>,
-    ) -> Result<(), EngineObjectValidationError> {
-        validate_version_specific_fields(self.chain_spec(), version, payload_or_attrs)
-    }
-
-    fn ensure_well_formed_attributes(
-        &self,
-        version: EngineApiMessageVersion,
-        attributes: &EthPayloadAttributes,
-    ) -> Result<(), EngineObjectValidationError> {
-        validate_version_specific_fields(self.chain_spec(), version, attributes.into())
-    }
 }

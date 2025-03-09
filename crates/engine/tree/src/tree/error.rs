@@ -4,8 +4,7 @@ use alloy_consensus::BlockHeader;
 use reth_consensus::ConsensusError;
 use reth_errors::{BlockExecutionError, BlockValidationError, ProviderError};
 use reth_evm::execute::InternalBlockExecutionError;
-use reth_primitives::SealedBlock;
-use reth_primitives_traits::{Block, BlockBody};
+use reth_primitives_traits::{Block, BlockBody, SealedBlock};
 use tokio::sync::oneshot::error::TryRecvError;
 
 /// This is an error that can come from advancing persistence. Either this can be a
@@ -74,11 +73,6 @@ impl<B: Block> InsertBlockError<B> {
         Self::new(block, InsertBlockErrorKind::Consensus(error))
     }
 
-    /// Create a new `InsertInvalidBlockError` from a consensus error
-    pub fn sender_recovery_error(block: SealedBlock<B>) -> Self {
-        Self::new(block, InsertBlockErrorKind::SenderRecovery)
-    }
-
     /// Consumes the error and returns the block that resulted in the error
     #[inline]
     pub fn into_block(self) -> SealedBlock<B> {
@@ -114,9 +108,6 @@ impl<B: Block> std::fmt::Debug for InsertBlockError<B> {
 /// All error variants possible when inserting a block
 #[derive(Debug, thiserror::Error)]
 pub enum InsertBlockErrorKind {
-    /// Failed to recover senders for the block
-    #[error("failed to recover senders for block")]
-    SenderRecovery,
     /// Block violated consensus rules.
     #[error(transparent)]
     Consensus(#[from] ConsensusError),
@@ -143,16 +134,12 @@ impl InsertBlockErrorKind {
         self,
     ) -> Result<InsertBlockValidationError, InsertBlockFatalError> {
         match self {
-            Self::SenderRecovery => Ok(InsertBlockValidationError::SenderRecovery),
             Self::Consensus(err) => Ok(InsertBlockValidationError::Consensus(err)),
             // other execution errors that are considered internal errors
             Self::Execution(err) => {
                 match err {
                     BlockExecutionError::Validation(err) => {
                         Ok(InsertBlockValidationError::Validation(err))
-                    }
-                    BlockExecutionError::Consensus(err) => {
-                        Ok(InsertBlockValidationError::Consensus(err))
                     }
                     // these are internal errors, not caused by an invalid block
                     BlockExecutionError::Internal(error) => {
@@ -180,20 +167,10 @@ pub enum InsertBlockFatalError {
 /// Error variants that are caused by invalid blocks
 #[derive(Debug, thiserror::Error)]
 pub enum InsertBlockValidationError {
-    /// Failed to recover senders for the block
-    #[error("failed to recover senders for block")]
-    SenderRecovery,
     /// Block violated consensus rules.
     #[error(transparent)]
     Consensus(#[from] ConsensusError),
     /// Validation error, transparently wrapping [`BlockValidationError`]
     #[error(transparent)]
     Validation(#[from] BlockValidationError),
-}
-
-impl InsertBlockValidationError {
-    /// Returns true if this is a block pre merge error.
-    pub const fn is_block_pre_merge(&self) -> bool {
-        matches!(self, Self::Validation(BlockValidationError::BlockPreMerge { .. }))
-    }
 }

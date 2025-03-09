@@ -19,8 +19,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
-extern crate alloc;
-
 mod block;
 mod receipt;
 pub use reth_static_file_types as static_file;
@@ -31,10 +29,11 @@ pub use block::{Block, BlockBody, SealedBlock};
 #[allow(deprecated)]
 pub use block::{BlockWithSenders, SealedBlockFor, SealedBlockWithSenders};
 
-pub use receipt::{gas_spent_by_transactions, Receipt, Receipts};
+pub use receipt::{gas_spent_by_transactions, Receipt};
 pub use reth_primitives_traits::{
-    logs_bloom, Account, Bytecode, GotExpected, GotExpectedBoxed, Header, HeaderError, Log,
-    LogData, NodePrimitives, RecoveredBlock, SealedHeader, StorageEntry,
+    logs_bloom, Account, BlockTy, BodyTy, Bytecode, GotExpected, GotExpectedBoxed, Header,
+    HeaderError, HeaderTy, Log, LogData, NodePrimitives, ReceiptTy, RecoveredBlock, SealedHeader,
+    StorageEntry, TxTy,
 };
 pub use static_file::StaticFileSegment;
 
@@ -75,15 +74,5 @@ pub mod serde_bincode_compat {
     pub use reth_primitives_traits::serde_bincode_compat::*;
 }
 
-/// Temp helper struct for integrating [`NodePrimitives`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[non_exhaustive]
-pub struct EthPrimitives;
-
-impl reth_primitives_traits::NodePrimitives for EthPrimitives {
-    type Block = crate::Block;
-    type BlockHeader = alloy_consensus::Header;
-    type BlockBody = crate::BlockBody;
-    type SignedTx = crate::TransactionSigned;
-    type Receipt = crate::Receipt;
-}
+// Re-export of `EthPrimitives`
+pub use reth_ethereum_primitives::EthPrimitives;
