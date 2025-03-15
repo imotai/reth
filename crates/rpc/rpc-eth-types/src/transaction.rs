@@ -4,8 +4,8 @@
 
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::TransactionInfo;
-use reth_primitives::{Recovered, TransactionSigned};
-use reth_primitives_traits::SignedTransaction;
+use reth_ethereum_primitives::TransactionSigned;
+use reth_primitives_traits::{Recovered, SignedTransaction};
 use reth_rpc_types_compat::TransactionCompat;
 
 /// Represents from where a transaction was fetched.
@@ -51,7 +51,7 @@ impl<T: SignedTransaction> TransactionSource<T> {
                     index: Some(index),
                     block_hash: Some(block_hash),
                     block_number: Some(block_number),
-                    base_fee: base_fee.map(u128::from),
+                    base_fee,
                 };
 
                 resp_builder.fill(transaction, tx_info)
@@ -75,7 +75,7 @@ impl<T: SignedTransaction> TransactionSource<T> {
                         index: Some(index),
                         block_hash: Some(block_hash),
                         block_number: Some(block_number),
-                        base_fee: base_fee.map(u128::from),
+                        base_fee,
                     },
                 )
             }

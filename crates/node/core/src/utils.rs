@@ -9,8 +9,7 @@ use reth_consensus::{Consensus, ConsensusError};
 use reth_network_p2p::{
     bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority,
 };
-use reth_primitives::SealedBlock;
-use reth_primitives_traits::{Block, SealedHeader};
+use reth_primitives_traits::{Block, SealedBlock, SealedHeader};
 use std::{
     env::VarError,
     path::{Path, PathBuf},
@@ -34,7 +33,7 @@ pub fn get_or_create_jwt_secret_from_path(path: &Path) -> Result<JwtSecret, JwtE
     }
 }
 
-/// Get a single header from network
+/// Get a single header from the network
 pub async fn get_single_header<Client>(
     client: Client,
     id: BlockHashOrNumber,
@@ -68,7 +67,7 @@ where
     Ok(header)
 }
 
-/// Get a body from network based on header
+/// Get a body from the network based on header
 pub async fn get_single_body<B, Client>(
     client: Client,
     header: SealedHeader<B::Header>,

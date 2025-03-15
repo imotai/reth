@@ -11,10 +11,15 @@
 
 extern crate alloc;
 
-pub mod bedrock;
-pub mod transaction;
+#[cfg(feature = "alloy-compat")]
+mod alloy_compat;
 
-use reth_primitives_traits::Block;
+pub mod bedrock;
+
+pub mod predeploys;
+pub use predeploys::ADDRESS_L2_TO_L1_MESSAGE_PASSER;
+
+pub mod transaction;
 pub use transaction::{signed::OpTransactionSigned, tx_type::OpTxType};
 
 mod receipt;
@@ -24,17 +29,23 @@ pub use receipt::{DepositReceipt, OpReceipt};
 pub type OpBlock = alloy_consensus::Block<OpTransactionSigned>;
 
 /// Optimism-specific block body type.
-pub type OpBlockBody = <OpBlock as Block>::Body;
+pub type OpBlockBody = <OpBlock as reth_primitives_traits::Block>::Body;
 
 /// Primitive types for Optimism Node.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OpPrimitives;
 
-#[cfg(feature = "optimism")]
 impl reth_primitives_traits::NodePrimitives for OpPrimitives {
     type Block = OpBlock;
     type BlockHeader = alloy_consensus::Header;
     type BlockBody = OpBlockBody;
     type SignedTx = OpTransactionSigned;
     type Receipt = OpReceipt;
+}
+
+/// Bincode-compatible serde implementations.
+#[cfg(feature = "serde-bincode-compat")]
+pub mod serde_bincode_compat {
+    pub use super::receipt::serde_bincode_compat::*;
 }

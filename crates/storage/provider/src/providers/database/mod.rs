@@ -11,11 +11,13 @@ use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::{eip4895::Withdrawals, BlockHashOrNumber};
 use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256, U256};
 use core::fmt;
-use reth_chainspec::{ChainInfo, EthereumHardforks};
+use reth_chainspec::ChainInfo;
 use reth_db::{init_db, mdbx::DatabaseArguments, DatabaseEnv};
 use reth_db_api::{database::Database, models::StoredBlockBodyIndices};
 use reth_errors::{RethError, RethResult};
-use reth_node_types::{BlockTy, HeaderTy, NodeTypesWithDB, ReceiptTy, TxTy};
+use reth_node_types::{
+    BlockTy, HeaderTy, NodeTypes, NodeTypesWithDB, NodeTypesWithDBAdapter, ReceiptTy, TxTy,
+};
 use reth_primitives::{RecoveredBlock, SealedBlock, SealedHeader, StaticFileSegment};
 use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
@@ -26,7 +28,7 @@ use reth_storage_api::{
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::HashedPostState;
 use reth_trie_db::StateCommitment;
-use revm::db::BundleState;
+use revm_database::BundleState;
 use std::{
     ops::{RangeBounds, RangeInclusive},
     path::Path,
@@ -40,6 +42,9 @@ pub use provider::{DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW};
 
 use super::ProviderNodeTypes;
 
+mod builder;
+pub use builder::{ProviderFactoryBuilder, ReadOnlyConfig};
+
 mod metrics;
 
 mod chain;
@@ -49,7 +54,7 @@ pub use chain::*;
 ///
 /// This provider implements most provider or provider factory traits.
 pub struct ProviderFactory<N: NodeTypesWithDB> {
-    /// Database
+    /// Database instance
     db: N::DB,
     /// Chain spec
     chain_spec: Arc<N::ChainSpec>,
@@ -61,19 +66,10 @@ pub struct ProviderFactory<N: NodeTypesWithDB> {
     storage: Arc<N::Storage>,
 }
 
-impl<N> fmt::Debug for ProviderFactory<N>
-where
-    N: NodeTypesWithDB<DB: fmt::Debug, ChainSpec: fmt::Debug, Storage: fmt::Debug>,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { db, chain_spec, static_file_provider, prune_modes, storage } = self;
-        f.debug_struct("ProviderFactory")
-            .field("db", &db)
-            .field("chain_spec", &chain_spec)
-            .field("static_file_provider", &static_file_provider)
-            .field("prune_modes", &prune_modes)
-            .field("storage", &storage)
-            .finish()
+impl<N: NodeTypes> ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>> {
+    /// Instantiates the builder for this type
+    pub fn builder() -> ProviderFactoryBuilder<N> {
+        ProviderFactoryBuilder::default()
     }
 }
 
@@ -261,18 +257,7 @@ impl<N: ProviderNodeTypes> HeaderProvider for ProviderFactory<N> {
     }
 
     fn header_td_by_number(&self, number: BlockNumber) -> ProviderResult<Option<U256>> {
-        if let Some(td) = self.chain_spec.final_paris_total_difficulty(number) {
-            // if this block is higher than the final paris(merge) block, return the final paris
-            // difficulty
-            return Ok(Some(td))
-        }
-
-        self.static_file_provider.get_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            number,
-            |static_file| static_file.header_td_by_number(number),
-            || self.provider()?.header_td_by_number(number),
-        )
+        self.provider()?.header_td_by_number(number)
     }
 
     fn headers_range(
@@ -394,12 +379,12 @@ impl<N: ProviderNodeTypes> BlockReader for ProviderFactory<N> {
         self.provider()?.pending_block_and_receipts()
     }
 
-    fn block_with_senders(
+    fn recovered_block(
         &self,
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        self.provider()?.block_with_senders(id, transaction_kind)
+        self.provider()?.recovered_block(id, transaction_kind)
     }
 
     fn sealed_block_with_senders(
@@ -421,11 +406,11 @@ impl<N: ProviderNodeTypes> BlockReader for ProviderFactory<N> {
         self.provider()?.block_with_senders_range(range)
     }
 
-    fn sealed_block_with_senders_range(
+    fn recovered_block_range(
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
-        self.provider()?.sealed_block_with_senders_range(range)
+        self.provider()?.recovered_block_range(range)
     }
 }
 
@@ -630,6 +615,22 @@ impl<N: ProviderNodeTypes> HashedPostStateProvider for ProviderFactory<N> {
     }
 }
 
+impl<N> fmt::Debug for ProviderFactory<N>
+where
+    N: NodeTypesWithDB<DB: fmt::Debug, ChainSpec: fmt::Debug, Storage: fmt::Debug>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { db, chain_spec, static_file_provider, prune_modes, storage } = self;
+        f.debug_struct("ProviderFactory")
+            .field("db", &db)
+            .field("chain_spec", &chain_spec)
+            .field("static_file_provider", &static_file_provider)
+            .field("prune_modes", &prune_modes)
+            .field("storage", &storage)
+            .finish()
+    }
+}
+
 impl<N: NodeTypesWithDB> Clone for ProviderFactory<N> {
     fn clone(&self) -> Self {
         Self {
@@ -657,9 +658,9 @@ mod tests {
     use reth_chainspec::ChainSpecBuilder;
     use reth_db::{
         mdbx::DatabaseArguments,
-        tables,
         test_utils::{create_test_static_files_dir, ERROR_TEMPDIR},
     };
+    use reth_db_api::tables;
     use reth_primitives::StaticFileSegment;
     use reth_primitives_traits::SignedTransaction;
     use reth_prune_types::{PruneMode, PruneModes};

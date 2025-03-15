@@ -43,7 +43,7 @@ pub struct PendingPool<T: TransactionOrdering> {
     independent_transactions: FxHashMap<SenderId, PendingTransaction<T>>,
     /// Keeps track of the size of this pool.
     ///
-    /// See also [`PoolTransaction::size`](crate::traits::PoolTransaction::size).
+    /// See also [`reth_primitives_traits::InMemorySize::size`].
     size_of: SizeTracker,
     /// Used to broadcast new transactions that have been added to the `PendingPool` to existing
     /// `static_files` of this pool.
@@ -98,7 +98,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
     /// provides a way to mark transactions that the consumer of this iterator considers invalid. In
     /// which case the transaction's subgraph is also automatically marked invalid, See (1.).
     /// Invalid transactions are skipped.
-    pub(crate) fn best(&self) -> BestTransactions<T> {
+    pub fn best(&self) -> BestTransactions<T> {
         BestTransactions {
             all: self.by_id.clone(),
             independent: self.independent_transactions.values().cloned().collect(),
@@ -613,8 +613,8 @@ mod tests {
         test_utils::{MockOrdering, MockTransaction, MockTransactionFactory, MockTransactionSet},
         PoolTransaction,
     };
+    use alloy_consensus::{Transaction, TxType};
     use alloy_primitives::address;
-    use reth_primitives::TxType;
     use std::collections::HashSet;
 
     #[test]
@@ -704,27 +704,23 @@ mod tests {
         let mut f = MockTransactionFactory::default();
         let mut pool = PendingPool::new(MockOrdering::default());
 
-        let a_sender = address!("000000000000000000000000000000000000000a");
-        let b_sender = address!("000000000000000000000000000000000000000b");
-        let c_sender = address!("000000000000000000000000000000000000000c");
-        let d_sender = address!("000000000000000000000000000000000000000d");
+        let a_sender = address!("0x000000000000000000000000000000000000000a");
+        let b_sender = address!("0x000000000000000000000000000000000000000b");
+        let c_sender = address!("0x000000000000000000000000000000000000000c");
+        let d_sender = address!("0x000000000000000000000000000000000000000d");
 
         // create a chain of transactions by sender A, B, C
-        let mut tx_set =
-            MockTransactionSet::dependent(a_sender, 0, 4, reth_primitives::TxType::Eip1559);
+        let mut tx_set = MockTransactionSet::dependent(a_sender, 0, 4, TxType::Eip1559);
         let a = tx_set.clone().into_vec();
 
-        let b = MockTransactionSet::dependent(b_sender, 0, 3, reth_primitives::TxType::Eip1559)
-            .into_vec();
+        let b = MockTransactionSet::dependent(b_sender, 0, 3, TxType::Eip1559).into_vec();
         tx_set.extend(b.clone());
 
         // C has the same number of txs as B
-        let c = MockTransactionSet::dependent(c_sender, 0, 3, reth_primitives::TxType::Eip1559)
-            .into_vec();
+        let c = MockTransactionSet::dependent(c_sender, 0, 3, TxType::Eip1559).into_vec();
         tx_set.extend(c.clone());
 
-        let d = MockTransactionSet::dependent(d_sender, 0, 1, reth_primitives::TxType::Eip1559)
-            .into_vec();
+        let d = MockTransactionSet::dependent(d_sender, 0, 1, TxType::Eip1559).into_vec();
         tx_set.extend(d.clone());
 
         // add all the transactions to the pool
@@ -757,10 +753,10 @@ mod tests {
         let mut pool = PendingPool::new(MockOrdering::default());
 
         // Addresses for simulated senders A, B, C, and D.
-        let a = address!("000000000000000000000000000000000000000a");
-        let b = address!("000000000000000000000000000000000000000b");
-        let c = address!("000000000000000000000000000000000000000c");
-        let d = address!("000000000000000000000000000000000000000d");
+        let a = address!("0x000000000000000000000000000000000000000a");
+        let b = address!("0x000000000000000000000000000000000000000b");
+        let c = address!("0x000000000000000000000000000000000000000c");
+        let d = address!("0x000000000000000000000000000000000000000d");
 
         // Create transaction chains for senders A, B, C, and D.
         let a_txs = MockTransactionSet::sequential_transactions_by_sender(a, 4, TxType::Eip1559);
@@ -985,9 +981,9 @@ mod tests {
         let mut pool = PendingPool::new(MockOrdering::default());
 
         // Addresses for simulated senders A, B, C
-        let a = address!("000000000000000000000000000000000000000a");
-        let b = address!("000000000000000000000000000000000000000b");
-        let c = address!("000000000000000000000000000000000000000c");
+        let a = address!("0x000000000000000000000000000000000000000a");
+        let b = address!("0x000000000000000000000000000000000000000b");
+        let c = address!("0x000000000000000000000000000000000000000c");
 
         // sender A (local) - 11+ transactions (large enough to keep limit exceeded)
         // sender B (external) - 2 transactions

@@ -2,8 +2,7 @@
 
 use alloy_consensus::BlockHeader;
 use futures::{future::Either, stream, stream_select, StreamExt};
-use reth_chainspec::EthChainSpec;
-use reth_consensus_debug_client::{DebugConsensusClient, EtherscanBlockProvider};
+use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_db_api::{database_metrics::DatabaseMetrics, Database};
 use reth_engine_local::{LocalEngineService, LocalPayloadAttributesBuilder};
 use reth_engine_service::service::{ChainEvent, EngineService};
@@ -17,7 +16,7 @@ use reth_network::{NetworkSyncUpdater, SyncState};
 use reth_network_api::BlockDownloaderProvider;
 use reth_node_api::{
     BeaconConsensusEngineHandle, BuiltPayload, FullNodeTypes, NodeTypesWithDBAdapter,
-    NodeTypesWithEngine, PayloadAttributesBuilder, PayloadBuilder, PayloadTypes,
+    NodeTypesWithEngine, PayloadAttributesBuilder, PayloadTypes,
 };
 use reth_node_core::{
     dirs::{ChainPath, DataDirPath},
@@ -25,7 +24,6 @@ use reth_node_core::{
     primitives::Head,
 };
 use reth_node_events::{cl::ConsensusLayerHealthEvents, node};
-use reth_primitives::EthereumHardforks;
 use reth_provider::providers::{BlockchainProvider, NodeTypesForProvider};
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
@@ -102,7 +100,7 @@ where
             // load the toml config
             .with_loaded_toml_config(config)?
             // add resolved peers
-            .with_resolved_peers().await?
+            .with_resolved_peers()?
             // attach the database
             .attach(database.clone())
             // ensure certain settings take effect
@@ -143,20 +141,6 @@ where
         let (consensus_engine_tx, consensus_engine_rx) = unbounded_channel();
 
         let node_config = ctx.node_config();
-        let consensus_engine_stream = UnboundedReceiverStream::from(consensus_engine_rx)
-            .maybe_skip_fcu(node_config.debug.skip_fcu)
-            .maybe_skip_new_payload(node_config.debug.skip_new_payload)
-            // .maybe_reorg(
-            //     ctx.blockchain_db().clone(),
-            //     ctx.components().evm_config().clone(),
-            //     reth_payload_validator::ExecutionPayloadValidator::new(ctx.chain_spec()),
-            //     node_config.debug.reorg_frequency,
-            //     node_config.debug.reorg_depth,
-            // )
-            // Store messages _after_ skipping so that `replay-engine` command
-            // would replay only the messages that were observed by the engine
-            // during this run.
-            .maybe_store_messages(node_config.debug.engine_api_store.clone());
 
         let max_block = ctx.max_block(network_client.clone()).await?;
 
@@ -198,6 +182,7 @@ where
         info!(target: "reth::cli", prune_config=?ctx.prune_config().unwrap_or_default(), "Pruner initialized");
 
         let event_sender = EventSender::default();
+
         let beacon_engine_handle = BeaconConsensusEngineHandle::new(consensus_engine_tx.clone());
 
         // extract the jwt secret from the args if possible
@@ -208,8 +193,24 @@ where
             config: ctx.node_config(),
             beacon_engine_handle: beacon_engine_handle.clone(),
             jwt_secret,
+            engine_events: event_sender.clone(),
         };
         let engine_payload_validator = add_ons.engine_validator(&add_ons_ctx).await?;
+
+        let consensus_engine_stream = UnboundedReceiverStream::from(consensus_engine_rx)
+            .maybe_skip_fcu(node_config.debug.skip_fcu)
+            .maybe_skip_new_payload(node_config.debug.skip_new_payload)
+            .maybe_reorg(
+                ctx.blockchain_db().clone(),
+                ctx.components().evm_config().clone(),
+                engine_payload_validator.clone(),
+                node_config.debug.reorg_frequency,
+                node_config.debug.reorg_depth,
+            )
+            // Store messages _after_ skipping so that `replay-engine` command
+            // would replay only the messages that were observed by the engine
+            // during this run.
+            .maybe_store_messages(node_config.debug.engine_api_store.clone());
 
         let mut engine_service = if ctx.is_dev() {
             let eth_service = LocalEngineService::new(
@@ -218,7 +219,7 @@ where
                 ctx.provider_factory().clone(),
                 ctx.blockchain_db().clone(),
                 pruner,
-                ctx.components().payload_builder().clone(),
+                ctx.components().payload_builder_handle().clone(),
                 engine_payload_validator,
                 engine_tree_config,
                 ctx.invalid_block_hook()?,
@@ -227,6 +228,7 @@ where
                 Box::pin(consensus_engine_stream),
                 ctx.dev_mining_mode(ctx.components().pool()),
                 LocalPayloadAttributesBuilder::new(ctx.chain_spec()),
+                ctx.components().evm_config().clone(),
             );
 
             Either::Left(eth_service)
@@ -242,11 +244,12 @@ where
                 ctx.provider_factory().clone(),
                 ctx.blockchain_db().clone(),
                 pruner,
-                ctx.components().payload_builder().clone(),
+                ctx.components().payload_builder_handle().clone(),
                 engine_payload_validator,
                 engine_tree_config,
                 ctx.invalid_block_hook()?,
                 ctx.sync_metrics_tx(),
+                ctx.components().evm_config().clone(),
             );
 
             Either::Right(eth_service)
@@ -268,6 +271,7 @@ where
             pruner_events.map(Into::into),
             static_file_producer_events.map(Into::into),
         );
+
         ctx.task_executor().spawn_critical(
             "events task",
             node::handle_events(
@@ -277,45 +281,15 @@ where
             ),
         );
 
-        let RpcHandle { rpc_server_handles, rpc_registry } =
+        let RpcHandle { rpc_server_handles, rpc_registry, engine_events, beacon_engine_handle } =
             add_ons.launch_add_ons(add_ons_ctx).await?;
-
-        // TODO: migrate to devmode with https://github.com/paradigmxyz/reth/issues/10104
-        if let Some(maybe_custom_etherscan_url) = ctx.node_config().debug.etherscan.clone() {
-            info!(target: "reth::cli", "Using etherscan as consensus client");
-
-            let chain = ctx.node_config().chain.chain();
-            let etherscan_url = maybe_custom_etherscan_url.map(Ok).unwrap_or_else(|| {
-                // If URL isn't provided, use default Etherscan URL for the chain if it is known
-                chain
-                    .etherscan_urls()
-                    .map(|urls| urls.0.to_string())
-                    .ok_or_else(|| eyre::eyre!("failed to get etherscan url for chain: {chain}"))
-            })?;
-
-            let block_provider = EtherscanBlockProvider::new(
-                etherscan_url,
-                chain.etherscan_api_key().ok_or_else(|| {
-                    eyre::eyre!(
-                        "etherscan api key not found for rpc consensus client for chain: {chain}"
-                    )
-                })?,
-            );
-            let rpc_consensus_client = DebugConsensusClient::new(
-                rpc_server_handles.auth.clone(),
-                Arc::new(block_provider),
-            );
-            ctx.task_executor().spawn_critical("etherscan consensus client", async move {
-                rpc_consensus_client.run::<<Types as NodeTypesWithEngine>::Engine>().await
-            });
-        }
 
         // Run consensus engine to completion
         let initial_target = ctx.initial_backfill_target()?;
         let network_handle = ctx.components().network().clone();
         let mut built_payloads = ctx
             .components()
-            .payload_builder()
+            .payload_builder_handle()
             .subscribe()
             .await
             .map_err(|e| eyre::eyre!("Failed to subscribe to payload builder events: {:?}", e))?
@@ -374,9 +348,7 @@ where
                                         hash: head.hash(),
                                         difficulty: head.difficulty(),
                                         timestamp: head.timestamp(),
-                                        total_difficulty: chainspec
-                                            .final_paris_total_difficulty(head.number())
-                                            .unwrap_or_default(),
+                                        total_difficulty: chainspec.final_paris_total_difficulty().filter(|_| chainspec.is_paris_active_at_block(head.number())).unwrap_or_default(),
                                     };
                                     network_handle.update_status(head_block);
                                 }
@@ -396,11 +368,16 @@ where
             pool: ctx.components().pool().clone(),
             network: ctx.components().network().clone(),
             provider: ctx.node_adapter().provider.clone(),
-            payload_builder: ctx.components().payload_builder().clone(),
+            payload_builder_handle: ctx.components().payload_builder_handle().clone(),
             task_executor: ctx.task_executor().clone(),
             config: ctx.node_config().clone(),
             data_dir: ctx.data_dir().clone(),
-            add_ons_handle: RpcHandle { rpc_server_handles, rpc_registry },
+            add_ons_handle: RpcHandle {
+                rpc_server_handles,
+                rpc_registry,
+                engine_events,
+                beacon_engine_handle,
+            },
         };
         // Notify on node started
         on_node_started.on_event(FullNode::clone(&full_node))?;

@@ -5,7 +5,7 @@ use crate::{
     MaybeSerdeBincodeCompat, SignedTransaction,
 };
 use alloc::{fmt, vec::Vec};
-use alloy_consensus::{Header, Transaction, Typed2718};
+use alloy_consensus::{Transaction, Typed2718};
 use alloy_eips::{eip2718::Encodable2718, eip4895::Withdrawals};
 use alloy_primitives::{Address, Bytes, B256};
 
@@ -42,8 +42,21 @@ pub trait BlockBody:
     /// Returns reference to transactions in the block.
     fn transactions(&self) -> &[Self::Transaction];
 
+    /// A Convenience function to convert this type into the regular ethereum block body that
+    /// consists of:
+    ///
+    /// - Transactions
+    /// - Withdrawals
+    /// - Ommers
+    ///
+    /// Note: This conversion can be incomplete. It is not expected that this `Body` is the same as
+    /// [`alloy_consensus::BlockBody`] only that it can be converted into it which is useful for
+    /// the `eth_` RPC namespace (e.g. RPC block).
+    fn into_ethereum_body(self)
+        -> alloy_consensus::BlockBody<Self::Transaction, Self::OmmerHeader>;
+
     /// Returns an iterator over the transactions in the block.
-    fn transactions_iter(&self) -> impl Iterator<Item = &Self::Transaction> {
+    fn transactions_iter(&self) -> impl Iterator<Item = &Self::Transaction> + '_ {
         self.transactions().iter()
     }
 
@@ -89,7 +102,7 @@ pub trait BlockBody:
 
     /// Calculate the withdrawals root for the block body.
     ///
-    /// Returns `None` if there are no withdrawals in the block.
+    /// Returns `RecoveryError` if there are no withdrawals in the block.
     fn calculate_withdrawals_root(&self) -> Option<B256> {
         self.withdrawals().map(|withdrawals| {
             alloy_consensus::proofs::calculate_withdrawals_root(withdrawals.as_slice())
@@ -101,7 +114,7 @@ pub trait BlockBody:
 
     /// Calculate the ommers root for the block body.
     ///
-    /// Returns `None` if there are no ommers in the block.
+    /// Returns `RecoveryError` if there are no ommers in the block.
     fn calculate_ommers_root(&self) -> Option<B256> {
         self.ommers().map(alloy_consensus::proofs::calculate_ommers_root)
     }
@@ -141,7 +154,7 @@ pub trait BlockBody:
     where
         Self::Transaction: SignedTransaction,
     {
-        crate::transaction::recover::recover_signers(self.transactions()).map_err(|_| RecoveryError)
+        crate::transaction::recover::recover_signers(self.transactions())
     }
 
     /// Recover signer addresses for all transactions in the block body.
@@ -157,7 +170,7 @@ pub trait BlockBody:
     /// Recover signer addresses for all transactions in the block body _without ensuring that the
     /// signature has a low `s` value_.
     ///
-    /// Returns `None`, if some transaction's signature is invalid.
+    /// Returns `RecoveryError`, if some transaction's signature is invalid.
     fn recover_signers_unchecked(&self) -> Result<Vec<Address>, RecoveryError>
     where
         Self::Transaction: SignedTransaction,
@@ -177,15 +190,20 @@ pub trait BlockBody:
     }
 }
 
-impl<T> BlockBody for alloy_consensus::BlockBody<T>
+impl<T, H> BlockBody for alloy_consensus::BlockBody<T, H>
 where
     T: SignedTransaction,
+    H: BlockHeader,
 {
     type Transaction = T;
-    type OmmerHeader = Header;
+    type OmmerHeader = H;
 
     fn transactions(&self) -> &[Self::Transaction] {
         &self.transactions
+    }
+
+    fn into_ethereum_body(self) -> Self {
+        self
     }
 
     fn into_transactions(self) -> Vec<Self::Transaction> {

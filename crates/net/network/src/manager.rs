@@ -159,14 +159,31 @@ impl NetworkManager {
 }
 
 impl<N: NetworkPrimitives> NetworkManager<N> {
-    /// Sets the dedicated channel for events indented for the
+    /// Sets the dedicated channel for events intended for the
+    /// [`TransactionsManager`](crate::transactions::TransactionsManager).
+    pub fn with_transactions(
+        mut self,
+        tx: mpsc::UnboundedSender<NetworkTransactionEvent<N>>,
+    ) -> Self {
+        self.set_transactions(tx);
+        self
+    }
+
+    /// Sets the dedicated channel for events intended for the
     /// [`TransactionsManager`](crate::transactions::TransactionsManager).
     pub fn set_transactions(&mut self, tx: mpsc::UnboundedSender<NetworkTransactionEvent<N>>) {
         self.to_transactions_manager =
             Some(UnboundedMeteredSender::new(tx, NETWORK_POOL_TRANSACTIONS_SCOPE));
     }
 
-    /// Sets the dedicated channel for events indented for the
+    /// Sets the dedicated channel for events intended for the
+    /// [`EthRequestHandler`](crate::eth_requests::EthRequestHandler).
+    pub fn with_eth_request_handler(mut self, tx: mpsc::Sender<IncomingEthRequest<N>>) -> Self {
+        self.set_eth_request_handler(tx);
+        self
+    }
+
+    /// Sets the dedicated channel for events intended for the
     /// [`EthRequestHandler`](crate::eth_requests::EthRequestHandler).
     pub fn set_eth_request_handler(&mut self, tx: mpsc::Sender<IncomingEthRequest<N>>) {
         self.to_eth_request_handler = Some(tx);
@@ -231,6 +248,7 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
             tx_gossip_disabled,
             transactions_manager_config: _,
             nat,
+            handshake,
         } = config;
 
         let peers_manager = PeersManager::new(peers_config);
@@ -282,6 +300,7 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
             hello_message,
             fork_filter,
             extra_protocols,
+            handshake,
         );
 
         let state = NetworkState::new(
@@ -739,6 +758,13 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
 
                 self.update_active_connection_metrics();
 
+                let peer_kind = self
+                    .swarm
+                    .state()
+                    .peers()
+                    .peer_by_id(peer_id)
+                    .map(|(_, kind)| kind)
+                    .unwrap_or_default();
                 let session_info = SessionInfo {
                     peer_id,
                     remote_addr,
@@ -746,6 +772,7 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
                     capabilities,
                     status,
                     version,
+                    peer_kind,
                 };
 
                 self.event_sender

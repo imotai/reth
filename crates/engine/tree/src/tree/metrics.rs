@@ -67,6 +67,8 @@ pub(crate) struct BlockValidationMetrics {
     pub(crate) state_root_histogram: Histogram,
     /// Latest state root duration
     pub(crate) state_root_duration: Gauge,
+    /// Trie input computation duration
+    pub(crate) trie_input_duration: Histogram,
 }
 
 impl BlockValidationMetrics {
@@ -82,7 +84,7 @@ impl BlockValidationMetrics {
 /// Metrics for the blockchain tree block buffer
 #[derive(Metrics)]
 #[metrics(scope = "blockchain_tree.block_buffer")]
-pub(super) struct BlockBufferMetrics {
+pub(crate) struct BlockBufferMetrics {
     /// Total blocks in the block buffer
     pub blocks: Gauge,
 }

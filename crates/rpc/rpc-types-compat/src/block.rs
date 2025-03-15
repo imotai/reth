@@ -2,13 +2,13 @@
 
 use crate::transaction::TransactionCompat;
 use alloy_consensus::{BlockHeader, Sealable};
-use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::U256;
 use alloy_rpc_types_eth::{
     Block, BlockTransactions, BlockTransactionsKind, Header, TransactionInfo,
 };
-use reth_primitives::{transaction::SignedTransactionIntoRecoveredExt, RecoveredBlock};
-use reth_primitives_traits::{Block as BlockTrait, BlockBody, SealedHeader, SignedTransaction};
+use reth_primitives_traits::{
+    Block as BlockTrait, BlockBody, RecoveredBlock, SealedHeader, SignedTransaction,
+};
 
 /// Converts the given primitive block into a [`Block`] response with the given
 /// [`BlockTransactionsKind`]
@@ -30,7 +30,7 @@ where
     }
 }
 
-/// Create a new [`Block`] response from a [primitive block](reth_primitives::Block), using the
+/// Create a new [`Block`] response from a [`RecoveredBlock`], using the
 /// total difficulty to populate its field in the rpc response.
 ///
 /// This will populate the `transactions` field with only the hashes of the transactions in the
@@ -50,7 +50,7 @@ where
     )
 }
 
-/// Create a new [`Block`] response from a [primitive block](reth_primitives::Block), using the
+/// Create a new [`Block`] response from a [`RecoveredBlock`], using the
 /// total difficulty to populate its field in the rpc response.
 ///
 /// This will populate the `transactions` field with the _full_
@@ -65,28 +65,23 @@ where
     B: BlockTrait,
 {
     let block_number = block.header().number();
-    let base_fee_per_gas = block.header().base_fee_per_gas();
-
-    // NOTE: we can safely remove the body here because not needed to finalize the `Block` in
-    // `from_block_with_transactions`, however we need to compute the length before
+    let base_fee = block.header().base_fee_per_gas();
     let block_length = block.rlp_length();
-    let transactions = block.body().transactions().to_vec();
-    let transactions_with_senders = transactions.into_iter().zip(block.senders_iter().copied());
     let block_hash = Some(block.hash());
-    let transactions = transactions_with_senders
+
+    let transactions = block
+        .transactions_recovered()
         .enumerate()
-        .map(|(idx, (tx, sender))| {
-            let tx_hash = *tx.tx_hash();
-            let signed_tx_ec_recovered = tx.with_signer(sender);
+        .map(|(idx, tx)| {
             let tx_info = TransactionInfo {
-                hash: Some(tx_hash),
+                hash: Some(*tx.tx_hash()),
                 block_hash,
                 block_number: Some(block_number),
-                base_fee: base_fee_per_gas.map(u128::from),
+                base_fee,
                 index: Some(idx as u64),
             };
 
-            tx_resp_builder.fill(signed_tx_ec_recovered, tx_info)
+            tx_resp_builder.fill(tx.cloned(), tx_info)
         })
         .collect::<Result<Vec<_>, T::Error>>()?;
 
@@ -106,11 +101,8 @@ fn from_block_with_transactions<T, B: BlockTrait>(
     body: B::Body,
     transactions: BlockTransactions<T>,
 ) -> Block<T, Header<B::Header>> {
-    let withdrawals = header
-        .withdrawals_root()
-        .is_some()
-        .then(|| body.withdrawals().cloned().map(Withdrawals::into_inner).map(Into::into))
-        .flatten();
+    let withdrawals =
+        header.withdrawals_root().is_some().then(|| body.withdrawals().cloned()).flatten();
 
     let uncles =
         body.ommers().map(|o| o.iter().map(|h| h.hash_slow()).collect()).unwrap_or_default();

@@ -31,7 +31,7 @@ impl LoadedJar {
                 let mmap_handle = Arc::new(data_reader);
                 Ok(Self { jar, mmap_handle })
             }
-            Err(e) => Err(ProviderError::NippyJar(e.to_string())),
+            Err(e) => Err(ProviderError::other(e)),
         }
     }
 
@@ -61,11 +61,10 @@ mod tests {
     use alloy_consensus::{Header, Transaction};
     use alloy_primitives::{BlockHash, TxNumber, B256, U256};
     use rand::seq::SliceRandom;
-    use reth_db::{
-        test_utils::create_test_static_files_dir, CanonicalHeaders, HeaderNumbers,
-        HeaderTerminalDifficulties, Headers,
+    use reth_db::test_utils::create_test_static_files_dir;
+    use reth_db_api::{
+        transaction::DbTxMut, CanonicalHeaders, HeaderNumbers, HeaderTerminalDifficulties, Headers,
     };
-    use reth_db_api::transaction::DbTxMut;
     use reth_primitives::{
         static_file::{find_fixed_range, SegmentRangeInclusive, DEFAULT_BLOCKS_PER_STATIC_FILE},
         EthPrimitives, Receipt, TransactionSigned,
@@ -330,7 +329,7 @@ mod tests {
                         writer.append_receipt(*next_tx_num, &receipt).unwrap();
                     } else {
                         // Used as ID for validation
-                        tx.transaction.set_nonce(*next_tx_num);
+                        tx.transaction_mut().set_nonce(*next_tx_num);
                         writer.append_transaction(*next_tx_num, &tx).unwrap();
                     }
                     *next_tx_num += 1;
