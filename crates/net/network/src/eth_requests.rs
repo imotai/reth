@@ -18,7 +18,7 @@ use reth_network_api::test_utils::PeersHandle;
 use reth_network_p2p::error::RequestResult;
 use reth_network_peers::PeerId;
 use reth_primitives_traits::Block;
-use reth_storage_api::{BalProvider, BlockReader, HeaderProvider};
+use reth_storage_api::{BalProvider, BlockReader, GetBlockAccessListLimit, HeaderProvider};
 use std::{
     future::Future,
     pin::Pin,
@@ -326,16 +326,30 @@ where
         request: GetBlockAccessLists,
         response: oneshot::Sender<RequestResult<BlockAccessLists>>,
     ) {
+        let limit = GetBlockAccessListLimit::ResponseSizeSoftLimit(SOFT_RESPONSE_LIMIT);
         let access_lists = self
             .client
             .bal_store()
-            .get_by_hashes(&request.0)
-            .unwrap_or_else(|_| request.0.iter().map(|_| None).collect())
-            .into_iter()
-            .map(|bal| bal.unwrap_or_else(|| Bytes::from_static(&[alloy_rlp::EMPTY_LIST_CODE])))
-            .collect();
+            .get_by_hashes_with_limit(&request.0, limit)
+            .unwrap_or_else(|_| empty_block_access_lists_with_limit(request.0.len(), limit));
         let _ = response.send(Ok(BlockAccessLists(access_lists)));
     }
+}
+
+/// Builds the error fallback response while still enforcing the BAL response soft limit.
+fn empty_block_access_lists_with_limit(count: usize, limit: GetBlockAccessListLimit) -> Vec<Bytes> {
+    let mut out = Vec::with_capacity(count);
+    let mut size = 0;
+    for _ in 0..count {
+        let bal = Bytes::from_static(&[0xc0]);
+        size += bal.len();
+        out.push(bal);
+
+        if limit.exceeds(size) {
+            break
+        }
+    }
+    out
 }
 
 /// An endless future.
